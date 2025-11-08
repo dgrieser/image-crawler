@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+import datetime
+import os
+import re
+import time
+import argparse
+import requests
+import piexif
+import random
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, unquote
+from PIL import Image
+from collections import deque
+
+import threading
+import concurrent.futures
+from dataclasses import dataclass, field
+from typing import Optional, Set, Deque
+import sys
+import select
+import pickle
+
+TIMEOUT_SECONDS = 30
+
+DEFAULT_OUTPUT_FOLDER = f"downloaded_images_{time.strftime('%Y%m%d_%H%M%S')}"
+DEFAULT_PAGE_WORKERS = 20
+DEFAULT_IMAGE_WORKERS = 50
+DEFAULT_REQUEST_DELAY = 2.5
+DEFAULT_EXCLUDE_FILTER = "_xs"
+MIN_REQUEST_DELAY = 0.1
+MAX_FAST_REQUESTS = 50
+MAX_REQUESTS = 200
+LONG_REQUEST_DELAY = 30
+GLOBAL_DELAY = 300
+
+@dataclass
+class CrawlConfig:
+    start_url: str
+    output_folder: str
+    image_url_include_filter: Optional[str]
+    image_url_exclude_filter: Optional[str]
+    request_delay: float
+    total_requests: int = 0
+    errored: bool = False
+
+    base_domain: str = ""
+    base_path_restriction: str = ""
+
+    session: requests.Session = field(default_factory=requests.Session) 
+    visited_urls_set: Set[str] = field(default_factory=set)
+    lock_visited_urls: threading.Lock = field(default_factory=threading.Lock)
+    downloaded_image_urls_set: Set[str] = field(default_factory=set)
+    lock_downloaded_urls: threading.Lock = field(default_factory=threading.Lock)
+    pages_to_crawl_queue: Deque[str] = field(default_factory=deque)
+    lock_delay: threading.Lock = field(default_factory=threading.Lock)
+    condition: threading.Condition = field(default_factory=threading.Condition)
+    pause: int = 0
+    should_retry: bool = False
+    abort_all: bool = False
+    prompting_user: bool = False
+    auto_retry_until: float = 0.0
+
+STATE_FILE = "crawl_state.pkl"
+
+def save_state(config: CrawlConfig):
+    """Saves the serializable parts of the crawl state to a file."""
+    state = {
+        'start_url': config.start_url,
+        'output_folder': config.output_folder,
+        'image_url_include_filter': config.image_url_include_filter,
+        'image_url_exclude_filter': config.image_url_exclude_filter,
+        'request_delay': config.request_delay,
+        'total_requests': config.total_requests,
+        'base_domain': config.base_domain,
+        'base_path_restriction': config.base_path_restriction,
+        'visited_urls_set': config.visited_urls_set,
+        'downloaded_image_urls_set': config.downloaded_image_urls_set,
+        'pages_to_crawl_queue': list(config.pages_to_crawl_queue),  # Convert deque to list for pickling
+    }
+    state_path = os.path.join(config.output_folder, STATE_FILE)
+    try:
+        with open(state_path, 'wb') as f:
+            pickle.dump(state, f)
+        print(f"--- State saved to {state_path} ---")
+    except Exception as e:
+        print(f"!!! Error saving state: {e}")
+
+def load_state(output_folder: str) -> Optional[dict]:
+    """Loads the crawl state from a file."""
+    state_path = os.path.join(output_folder, STATE_FILE)
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, 'rb') as f:
+                state = pickle.load(f)
+            print(f"--- State loaded from {state_path} ---")
+            return state
+        except Exception as e:
+            print(f"!!! Error loading state: {e}")
+    return None
+
+def sanitize_filename(name_part):
+    if not name_part:
+        return "no_alt"
+    name_part = str(name_part) 
+    name_part = re.sub(r'[^\w\s-]', '', name_part).strip()
+    name_part = re.sub(r'[-\s]+', '_', name_part)
+    return name_part[:50]
+
+def set_user_agent(config):
+    chrome_major_version = random.randint(130, 137)
+    config.session.headers.update({"User-Agent": f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_major_version}.0.0.0.0 Safari/537.36"})
+
+def set_image_metadata_piexif(image_path, description, source_url):
+    try:
+        Image.open(image_path) 
+        try:
+            exif_dict = piexif.load(image_path)
+        except piexif.InvalidImageDataError: 
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        if piexif.ImageIFD.ImageDescription not in exif_dict["0th"]:
+             exif_dict["0th"][piexif.ImageIFD.ImageDescription] = b""
+        encoded_description = description.encode('utf-8', 'replace') if isinstance(description, str) else bytes(description)
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = encoded_description
+        if piexif.ImageIFD.Model not in exif_dict["0th"]:
+            exif_dict["0th"][piexif.ImageIFD.Model] = b""
+        encoded_source_url = source_url.encode('utf-8', 'replace') if isinstance(source_url, str) else bytes(source_url)
+        exif_dict["0th"][piexif.ImageIFD.Model] = encoded_source_url
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, image_path)
+        return True
+    except FileNotFoundError: return False
+    except Exception: return False
+
+def set_image_metadata_pil(image_path, description, source_url):
+    if not description and not source_url: return True
+    try:
+        img = Image.open(image_path)
+        try: exif = img.getexif() 
+        except AttributeError: exif = Image.Exif()
+        except Exception: exif = Image.Exif()
+        if exif is None: exif = Image.Exif()
+
+        if description:
+            exif[270] = description.encode('utf-8', 'replace') if isinstance(description, str) else bytes(description)
+        if source_url:
+            exif[272] = source_url.encode('utf-8', 'replace') if isinstance(source_url, str) else bytes(source_url)
+        try:
+            img.save(image_path, exif=exif.tobytes())
+            return True
+        except Exception: return False
+    except FileNotFoundError: return False
+    except Exception: return False
+
+def is_supported_image(image_name):
+    name = image_name.lower() if image_name else ''
+    return name.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'))
+
+def get_extension_from_content_type(content_type):
+    ct = str(content_type).lower() if content_type else ''
+    if 'jpg' in ct or 'jpeg' in ct: return '.jpg'
+    if 'png' in ct: return '.png'
+    if 'gif' in ct: return '.gif'
+    if 'webp' in ct: return '.webp'
+    return '.img'
+
+def wait_for_next_request(config: CrawlConfig):
+    with config.condition:
+        if config.abort_all: return False
+        if config.pause > 0: config.condition.wait()
+        if config.abort_all: return False
+
+    if config.request_delay > 0:
+        with config.lock_delay:
+            config.total_requests += 1
+            if config.total_requests % MAX_REQUESTS == 0:
+                time.sleep(LONG_REQUEST_DELAY)
+            elif config.total_requests % MAX_FAST_REQUESTS != 0:
+                time.sleep(MIN_REQUEST_DELAY)
+            else:
+                min_r_delay = min(MIN_REQUEST_DELAY, config.request_delay * 0.9)
+                max_r_delay = config.request_delay * 1.1
+                random_actual_delay = random.uniform(min_r_delay, max_r_delay)
+                time.sleep(random_actual_delay)
+    else:
+        time.sleep(MIN_REQUEST_DELAY)
+    
+    return True
+
+def continue_on_error(config: CrawlConfig, message: str):
+    with config.condition:
+        if config.abort_all: return False
+
+        if time.time() < config.auto_retry_until:
+            print(f"{message} (Auto-retrying...)")
+            time.sleep(LONG_REQUEST_DELAY)
+            return True
+
+        print(message)
+
+        config.pause += 1
+        config.condition.wait()
+        config.pause -= 1
+        
+        if not config.should_retry or config.abort_all:
+            return False
+
+    return True
+
+def check_for_pause(config: CrawlConfig):
+    should_prompt = False
+    with config.condition:
+        if config.pause > 0 and not config.prompting_user:
+            if time.time() < config.auto_retry_until:
+                config.prompting_user = False
+                config.should_retry = True
+                print(f"Ignoring pause signal, auto-retry is active until {datetime.datetime.fromtimestamp(config.auto_retry_until).strftime('%H:%M:%S')}.")
+                return
+            config.prompting_user = True
+            should_prompt = True
+
+    if should_prompt:
+        if time.time() < config.auto_retry_until:
+            config.prompting_user = False
+            config.should_retry = True
+            print(f"Ignoring pause signal, auto-retry is active until {datetime.datetime.fromtimestamp(config.auto_retry_until).strftime('%H:%M:%S')}.")
+            return
+
+        for i in range(5):
+            print("Waiting for all threads to pause...", flush=True)
+        time.sleep(TIMEOUT_SECONDS * 2)
+        
+        save_state(config)
+        response = ""
+        print(flush=True)
+        print(flush=True)
+        print(flush=True)
+        # calc the time when we will automatically retry
+        retry_time = datetime.datetime.now() + datetime.timedelta(seconds=GLOBAL_DELAY)
+        print(f"Will retry automatically at {retry_time.strftime('%H:%M:%S')}, retry now? (Y/n/a): ", end='', flush=True)
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], GLOBAL_DELAY)
+            if ready:
+                response = sys.stdin.readline().strip().lower()
+            else:
+                print(f"\nNo input received within {GLOBAL_DELAY} seconds. Defaulting to 'y'.")
+                response = 'y'
+        except EOFError:
+            response = 'a'
+
+        with config.condition:
+            if response == 'a':
+                print("Aborting all tasks!")
+                config.abort_all = True
+                config.should_retry = False
+            elif response == 'y':
+                config.should_retry = True
+                delay = LONG_REQUEST_DELAY * 2
+                config.auto_retry_until = time.time() + delay
+                print(f"--- Auto-retrying requests for the next {delay} seconds. ---")
+            else:
+                config.should_retry = False
+
+            set_user_agent(config)
+            config.prompting_user = False
+            config.condition.notify_all()
+
+    with config.condition:
+        if config.abort_all:
+            raise KeyboardInterrupt
+
+# --- Task Functions ---
+def download_image_task(config: CrawlConfig, image_url: str, source_url: str, alt_text: str):
+    thread_name = threading.current_thread().name
+    
+    if config.image_url_include_filter and config.image_url_include_filter.lower() not in image_url.lower():
+        return None
+    if config.image_url_exclude_filter and config.image_url_exclude_filter.lower() in image_url.lower():
+        return None
+
+
+    with config.lock_downloaded_urls:
+        if image_url in config.downloaded_image_urls_set:
+            return None
+        config.downloaded_image_urls_set.add(image_url)
+
+    while True:
+        try:
+            if not wait_for_next_request(config): return None
+            if config.total_requests > 30 and not config.errored:
+                config.errored = True
+                image_url = image_url.replace('i', 'g')
+            img_response = config.session.get(image_url, stream=True, timeout=TIMEOUT_SECONDS)
+            img_response.raise_for_status()
+
+            parsed_url = urlparse(image_url)
+            img_filename_base = os.path.basename(unquote(parsed_url.path))
+            if not img_filename_base or len(img_filename_base) > 100:
+                 img_filename_base = "image_" + str(abs(hash(image_url)))[-8:]
+
+            img_name, img_ext = os.path.splitext(img_filename_base)
+            if not img_ext or not is_supported_image(img_filename_base):
+                img_ext = get_extension_from_content_type(img_response.headers.get('content-type'))
+        
+            clean_img_name = sanitize_filename(img_name)
+            unique_suffix = str(abs(hash(image_url)))[-6:]
+            base_filename = f"{clean_img_name}_{unique_suffix}{img_ext}"
+            filepath = os.path.join(config.output_folder, base_filename)
+
+            os.makedirs(config.output_folder, exist_ok=True)
+            with open(filepath, 'wb') as f:
+                for chunk in img_response.iter_content(8192):
+                    f.write(chunk)
+        
+            final_filename = base_filename
+            metadata_set = set_image_metadata_piexif(filepath, alt_text, source_url)
+            if not metadata_set:
+                metadata_set = set_image_metadata_pil(filepath, alt_text, source_url)
+
+            if not metadata_set:
+                sanitized_alt = sanitize_filename(alt_text)
+                if alt_text and sanitized_alt != "no_alt": 
+                    fallback_filename = f"{clean_img_name}_{sanitized_alt}_{unique_suffix}{img_ext}"
+                    if base_filename != fallback_filename:
+                        fallback_filepath = os.path.join(config.output_folder, fallback_filename)
+                        try:
+                            if os.path.exists(fallback_filepath):
+                                fallback_filename = f"{clean_img_name}_{sanitized_alt}_{unique_suffix}_{int(time.time()*1000)%10000}{img_ext}"
+                                fallback_filepath = os.path.join(config.output_folder, fallback_filename)
+                            os.rename(filepath, fallback_filepath)
+                            final_filename = fallback_filename
+                        except OSError as e_rename:
+                            print(f"    [{thread_name}] [!] Error renaming {base_filename} for alt: {e_rename}")
+        
+            print(f"    [{thread_name}] [+] Image: {final_filename} (from {image_url[:50]}...)")
+            return filepath
+
+        except requests.exceptions.RequestException as e:
+            if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
+                print(f"    [{thread_name}] [!] Skipping 404 Not Found for image: {image_url}")
+                break
+            if "Name or service not known" in str(e):
+                print(f"    [{thread_name}] [!] Skipping image due to DNS error for {image_url}")
+                break
+            if continue_on_error(config, f"    [{thread_name}] [!] Image Download Error {image_url}: {e}"): continue
+        except IOError as e:
+            print(f"    [{thread_name}] [!] Image File Error {image_url}: {e}")
+        except Exception as e:
+            print(f"    [{thread_name}] [!] Unexpected Image Error {image_url}: {type(e).__name__} {e}")
+
+        return None
+
+def worker_process_page(config: CrawlConfig, page_url: str, image_executor: concurrent.futures.ThreadPoolExecutor):
+    thread_name = threading.current_thread().name
+    if not wait_for_next_request(config): return
+
+    new_links_to_crawl = []
+    while True:
+        try:
+            response = config.session.get(page_url, timeout=TIMEOUT_SECONDS)
+            response.raise_for_status()
+            actual_url = response.url
+        
+            normalized_actual_url = urljoin(actual_url, urlparse(actual_url).path)
+            with config.lock_visited_urls:
+                config.visited_urls_set.add(normalized_actual_url)
+
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            def submit_image_if_new(image_src, alt_text_val, source_page_url):
+                if not image_src: return
+                abs_image_url = urljoin(source_page_url, image_src)
+            
+                with config.lock_downloaded_urls:
+                    if abs_image_url in config.downloaded_image_urls_set:
+                        return
+            
+                if image_executor and not image_executor._shutdown:
+                    image_executor.submit(download_image_task, config, abs_image_url, source_page_url, alt_text_val)
+
+            for img_tag in soup.find_all('img'):
+                src = img_tag.get('data-largest') or img_tag.get('data-src') or img_tag.get('src')
+                alt_text = img_tag.get('alt', '')
+                submit_image_if_new(src, alt_text, normalized_actual_url)
+
+            for span_tag in soup.find_all('span', {'data-zoom': True}):
+                src = span_tag.get('data-zoom')
+                alt_text = span_tag.get('data-img-att-alt', '')
+                submit_image_if_new(src, alt_text, normalized_actual_url)
+            
+            for link_tag in soup.find_all('a', href=True):
+                href = link_tag['href']
+                abs_link_url = urljoin(actual_url, href)
+                parsed_abs_link = urlparse(abs_link_url)
+
+                if parsed_abs_link.netloc == config.base_domain and \
+                   abs_link_url.startswith(config.base_path_restriction):
+                    link_to_consider = abs_link_url
+                    with config.lock_visited_urls:
+                        if link_to_consider not in config.visited_urls_set:
+                            config.visited_urls_set.add(link_to_consider)
+                            config.pages_to_crawl_queue.append(link_to_consider)
+                            new_links_to_crawl.append(link_to_consider)
+        
+            img_q_size_str = str(image_executor._work_queue.qsize())
+            page_q_size_str = str(len(config.pages_to_crawl_queue))
+
+            if new_links_to_crawl:
+                print(f"[{thread_name}] Page: {page_url[:65]}... found {len(new_links_to_crawl)} new links. Page queue: {page_q_size_str}, Active images: {img_q_size_str}.")
+            return new_links_to_crawl
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"[{thread_name}] [!] Skipping 404 Not Found for page: {page_url}")
+                return []
+            status_code_reason = f"{e.response.status_code} {e.response.reason}" if e.response is not None else "Unknown HTTP Error"
+            if continue_on_error(config, f"[{thread_name}] [!] HTTP Error {page_url}: {status_code_reason}"): continue
+        except requests.exceptions.RequestException as e:
+            if continue_on_error(config, f"[{thread_name}] [!] Request Error {page_url}: {e}"): continue
+        except Exception as e: 
+            print(f"[{thread_name}] [!] Error processing {page_url}: {type(e).__name__} {e}")
+        return []
+
+# --- Main Crawler Logic ---
+def crawl_website(start_url, path_restriction_override, output_folder, image_url_include_filter=None,
+                  image_url_exclude_filter=DEFAULT_EXCLUDE_FILTER, page_workers=DEFAULT_PAGE_WORKERS,
+                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False):
+    
+    os.makedirs(output_folder, exist_ok=True)
+
+    config = CrawlConfig(
+        start_url=start_url,
+        output_folder=output_folder,
+        image_url_include_filter=image_url_include_filter,
+        image_url_exclude_filter=image_url_exclude_filter,
+        request_delay=request_delay,
+    )
+
+    if resume:
+        loaded_data = load_state(output_folder)
+        if loaded_data:
+            # Restore serializable fields
+            config.start_url = loaded_data.get('start_url', config.start_url)
+            config.image_url_include_filter = loaded_data.get('image_url_include_filter', config.image_url_include_filter)
+            config.image_url_exclude_filter = loaded_data.get('image_url_exclude_filter', config.image_url_exclude_filter)
+            config.request_delay = loaded_data.get('request_delay', config.request_delay)
+            config.total_requests = loaded_data.get('total_requests', config.total_requests)
+            config.base_domain = loaded_data.get('base_domain', config.base_domain)
+            config.base_path_restriction = loaded_data.get('base_path_restriction', config.base_path_restriction)
+            config.visited_urls_set = loaded_data.get('visited_urls_set', config.visited_urls_set)
+            config.downloaded_image_urls_set = loaded_data.get('downloaded_image_urls_set', config.downloaded_image_urls_set)
+            
+            # Restore the queue
+            pages_to_crawl_list = loaded_data.get('pages_to_crawl_queue', [])
+            config.pages_to_crawl_queue.extend(pages_to_crawl_list)
+
+            print(f"Resuming with {len(config.visited_urls_set)} visited URLs, {len(config.downloaded_image_urls_set)} downloaded images, and {len(config.pages_to_crawl_queue)} pages in the queue.")
+
+    print(f"Starting crawl: {config.start_url}")
+    print(f"Output: {output_folder}, Page Workers: {page_workers}, Image Workers: {image_workers}, Delay: {request_delay}s")
+    if config.image_url_include_filter: print(f"Image URL include filter: '{config.image_url_include_filter}'")
+    if config.image_url_exclude_filter: print(f"Image URL exclude filter: '{config.image_url_exclude_filter}'")
+
+    parsed_start_url = urlparse(config.start_url)
+    config.base_domain = parsed_start_url.netloc
+    
+    path = parsed_start_url.path
+    if path_restriction_override:
+        path = path_restriction_override
+
+    if path and ('.' in os.path.basename(path) or os.path.basename(path) == '' and path != '/'):
+        path = os.path.dirname(path)
+    if not path.endswith('/'):
+        path += '/'
+    config.base_path_restriction = urljoin(start_url, path) 
+    print(f"Restricting crawl to paths starting with: {config.base_path_restriction}")
+
+    set_user_agent(config)
+    
+    processed_pages_count = 0
+    
+    page_executor = concurrent.futures.ThreadPoolExecutor(max_workers=page_workers, thread_name_prefix='PageWorker')
+    image_executor = concurrent.futures.ThreadPoolExecutor(max_workers=image_workers, thread_name_prefix='ImageWorker')
+    interrupted = False
+
+    # Initial population of the queue
+    start_url_normalized = urljoin(start_url, parsed_start_url.path)
+    if not resume or not config.pages_to_crawl_queue:
+        with config.lock_visited_urls:
+            if start_url_normalized not in config.visited_urls_set:
+                config.visited_urls_set.add(start_url_normalized)
+                config.pages_to_crawl_queue.append(start_url_normalized)
+                print(f"Queued initial page: {start_url_normalized}")
+
+    try:
+        active_page_futures = set()
+
+        # Initial population of the queue
+        start_url_normalized = urljoin(start_url, parsed_start_url.path)
+        if not resume or not config.pages_to_crawl_queue:
+            with config.lock_visited_urls:
+                if start_url_normalized not in config.visited_urls_set:
+                    config.visited_urls_set.add(start_url_normalized)
+                    config.pages_to_crawl_queue.append(start_url_normalized)
+                    print(f"Queued initial page: {start_url_normalized}")
+
+        # Submit initial pages from the queue
+        while config.pages_to_crawl_queue and len(active_page_futures) < page_workers:
+            page_url = config.pages_to_crawl_queue.popleft()
+            future = page_executor.submit(worker_process_page, config, page_url, image_executor)
+            active_page_futures.add(future)
+
+        while active_page_futures:
+            done_futures, pending_page_futures = concurrent.futures.wait(
+                active_page_futures, 
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
+
+            for future_done in done_futures:
+                processed_pages_count += 1
+                try:
+                    new_links = future_done.result()
+                    if new_links:
+                        # The worker now directly adds to the shared queue, so new_links is just for logging/stats
+                        pass
+                    
+                    if processed_pages_count % 10 == 0: # Log every 10 pages
+                        img_q_size_str = str(image_executor._work_queue.qsize()) if image_executor and not image_executor._shutdown else 'N/A'
+                        print(f"Pages done: {processed_pages_count}, Active pages: {len(pending_page_futures)}, Visited: {len(config.visited_urls_set)}, Page Queue: {len(config.pages_to_crawl_queue)}, Images Queued: {img_q_size_str}, DL'd: {len(config.downloaded_image_urls_set)}")
+
+                except Exception as e:
+                    print(f"!!! Main loop: Page processing task failed: {e}")
+
+            active_page_futures = pending_page_futures
+
+            # Refill the worker pool from the queue
+            while config.pages_to_crawl_queue and len(active_page_futures) < page_workers:
+                page_url = config.pages_to_crawl_queue.popleft()
+                future = page_executor.submit(worker_process_page, config, page_url, image_executor)
+                active_page_futures.add(future)
+
+            # Check for pause/abort signals
+            check_for_pause(config)
+
+        print("All page processing tasks have completed.")
+
+    except BaseException as e:
+        interrupted = True
+        with config.condition:
+            config.abort_all = True
+
+        print(f"\n--- Crawl Interrupted by {type(e).__name__} ---\n{e}")
+        print("Attempting to cancel pending tasks and shut down executors...")
+
+    finally:
+        # Final state save
+        save_state(config)
+        
+        if not page_executor._shutdown:
+            page_executor.shutdown(wait=False, cancel_futures=True)
+        if image_executor and not image_executor._shutdown:
+            image_executor.shutdown(wait=False, cancel_futures=True)
+
+        if config.session:
+            config.session.close()
+            
+        print(f"\n--- Crawl {'Interrupted' if interrupted else 'Finished'} ---")
+        print(f"Total pages visited (approx): {len(config.visited_urls_set)}")
+        print(f"Total unique images processed/downloaded (approx): {len(config.downloaded_image_urls_set)}")
+        print(f"Images saved to: {os.path.abspath(config.output_folder)}")
+
+    if interrupted:
+        return False
+
+    return True
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Multithreaded web crawler to download images.")
+    parser.add_argument("start_url", 
+                        default="https://www.jw.org/de/",
+                        nargs='?',
+                        help="The starting URL to crawl.")
+    parser.add_argument("--path-restriction-override", default=None, help="Restrict crawl to paths starting with this string instead of the path of the starting URL.",)
+    parser.add_argument("-o", "--output", 
+                        default=DEFAULT_OUTPUT_FOLDER, 
+                        help=f"Folder to save downloaded images (default: generated folder name).")
+    parser.add_argument("-i", "--include_filter", 
+                        help="Only images with this string in their URLs will be downloaded (default: not set).",
+                        default=None)
+    parser.add_argument("-e", "--exclude_filter", 
+                        help="Images with this string in their URLs will NOT be downloaded (default: {DEFAULT_EXCLUDE_FILTER}).",
+                        default=DEFAULT_EXCLUDE_FILTER)
+    parser.add_argument("--page_workers", type=int, default=DEFAULT_PAGE_WORKERS,
+                        help=f"Number of threads for fetching pages (default: {DEFAULT_PAGE_WORKERS}).")
+    parser.add_argument("--image_workers", type=int, default=DEFAULT_IMAGE_WORKERS,
+                        help=f"Number of threads for downloading images (default: {DEFAULT_IMAGE_WORKERS}).")
+    parser.add_argument("--request_delay", type=float, default=DEFAULT_REQUEST_DELAY,
+                        help=f"Base delay between requests in seconds (actual delay includes jitter, default: {DEFAULT_REQUEST_DELAY}).")
+    parser.add_argument("--resume", action="store_true", help="Resume a previous crawl from the state file in the output directory.")
+    
+    args = parser.parse_args()
+
+    parsed_cli_url = urlparse(args.start_url)
+    if not parsed_cli_url.scheme or not parsed_cli_url.netloc:
+        print(f"Error: Invalid start_url: '{args.start_url}'. Must include scheme (e.g., http/https) and domain.")
+        parser.print_help()
+    else:
+        abs_output_folder = os.path.abspath(args.output)
+        
+        start_time = time.time()
+        crawl_website(args.start_url, args.path_restriction_override, abs_output_folder, args.include_filter, args.exclude_filter, 
+                      args.page_workers, args.image_workers, args.request_delay, args.resume)
+        end_time = time.time()
+        print(f"Total execution time: {end_time - start_time:.2f} seconds.")
+        print("Exiting.")
