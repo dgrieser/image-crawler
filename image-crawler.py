@@ -34,6 +34,8 @@ MAX_REQUESTS = 200
 LONG_REQUEST_DELAY = 30
 GLOBAL_DELAY = 300
 
+CHROME_VERSION = "141.0.0.0"
+
 @dataclass
 class CrawlConfig:
     start_url: str
@@ -110,8 +112,20 @@ def sanitize_filename(name_part):
     return name_part[:50]
 
 def set_user_agent(config):
-    chrome_major_version = random.randint(138, 141)
-    config.session.headers.update({"User-Agent": f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_major_version}.0.0.0.0 Safari/537.36"})
+    config.session.headers.update({
+        "User-Agent": f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_VERSION} Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": f'"Google Chrome";v="{CHROME_VERSION.split(".")[0]}", "Not-A.Brand";v="99", "Chromium";v="{CHROME_VERSION.split(".")[0]}"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Linux"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    })
 
 def set_image_metadata_piexif(image_path, description, source_url):
     try:
