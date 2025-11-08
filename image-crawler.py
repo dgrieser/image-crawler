@@ -19,6 +19,7 @@ from typing import Optional, Set, Deque
 import sys
 import select
 import pickle
+import termios
 
 TIMEOUT_SECONDS = 30
 
@@ -59,6 +60,8 @@ class CrawlConfig:
     abort_all: bool = False
     prompting_user: bool = False
     auto_retry_until: float = 0.0
+    non_interactive: bool = False
+    max_image_size_mb: float = 20.0
 
 STATE_FILE = "crawl_state.pkl"
 
@@ -219,6 +222,15 @@ def check_for_pause(config: CrawlConfig):
             should_prompt = True
 
     if should_prompt:
+        if config.non_interactive:
+            print("Non-interactive mode: Pausing for a moment and then automatically retrying.")
+            time.sleep(LONG_REQUEST_DELAY)
+            with config.condition:
+                config.should_retry = True
+                config.prompting_user = False
+                config.condition.notify_all()
+            return
+
         if time.time() < config.auto_retry_until:
             config.prompting_user = False
             config.should_retry = True
@@ -244,7 +256,7 @@ def check_for_pause(config: CrawlConfig):
             else:
                 print(f"\nNo input received within {GLOBAL_DELAY} seconds. Defaulting to 'y'.")
                 response = 'y'
-        except EOFError:
+        except (EOFError, termios.error):
             response = 'a'
 
         with config.condition:
@@ -286,6 +298,24 @@ def download_image_task(config: CrawlConfig, image_url: str, source_url: str, al
     while True:
         try:
             if not wait_for_next_request(config): return None
+
+            # 1. Use a HEAD request to check headers first
+            head_response = config.session.head(image_url, timeout=TIMEOUT_SECONDS)
+            head_response.raise_for_status()
+
+            # 2. Check Content-Type
+            content_type = head_response.headers.get('Content-Type', '')
+            if not content_type.lower().startswith('image/'):
+                print(f"    [{thread_name}] [!] Skipping non-image content: {image_url} ({content_type})")
+                return None
+
+            # 3. Check Content-Length
+            content_length = head_response.headers.get('Content-Length')
+            if content_length and int(content_length) > config.max_image_size_mb * 1024 * 1024:
+                size_in_mb = int(content_length) / (1024 * 1024)
+                print(f"    [{thread_name}] [!] Skipping large image: {size_in_mb:.2f}MB > {config.max_image_size_mb}MB for {image_url}")
+                return None
+
             if config.total_requests > 30 and not config.errored:
                 config.errored = True
                 image_url = image_url.replace('i', 'g')
@@ -423,7 +453,7 @@ def worker_process_page(config: CrawlConfig, page_url: str, image_executor: conc
 # --- Main Crawler Logic ---
 def crawl_website(start_url, path_restriction_override, output_folder, image_url_include_filter=None,
                   image_url_exclude_filter=DEFAULT_EXCLUDE_FILTER, page_workers=DEFAULT_PAGE_WORKERS,
-                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False):
+                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False, non_interactive=False, max_image_size_mb=20.0):
     
     os.makedirs(output_folder, exist_ok=True)
 
@@ -433,6 +463,8 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
         image_url_include_filter=image_url_include_filter,
         image_url_exclude_filter=image_url_exclude_filter,
         request_delay=request_delay,
+        non_interactive=non_interactive,
+        max_image_size_mb=max_image_size_mb,
     )
 
     if resume:
@@ -573,7 +605,34 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
     return True
 
+def check_dependencies():
+    """Checks for required external libraries."""
+    missing_deps = []
+    try:
+        import requests
+    except ImportError:
+        missing_deps.append("requests")
+    try:
+        import bs4
+    except ImportError:
+        missing_deps.append("beautifulsoup4")
+    try:
+        import PIL
+    except ImportError:
+        missing_deps.append("Pillow")
+    try:
+        import piexif
+    except ImportError:
+        missing_deps.append("piexif")
+
+    if missing_deps:
+        print("Error: Missing required libraries. Please install them using pip:")
+        for dep in missing_deps:
+            print(f"  pip install {dep}")
+        sys.exit(1)
+
 if __name__ == "__main__":
+    check_dependencies()
     parser = argparse.ArgumentParser(description="Multithreaded web crawler to download images.")
     parser.add_argument("start_url", 
                         default="https://www.jw.org/de/",
@@ -596,6 +655,8 @@ if __name__ == "__main__":
     parser.add_argument("--request_delay", type=float, default=DEFAULT_REQUEST_DELAY,
                         help=f"Base delay between requests in seconds (actual delay includes jitter, default: {DEFAULT_REQUEST_DELAY}).")
     parser.add_argument("--resume", action="store_true", help="Resume a previous crawl from the state file in the output directory.")
+    parser.add_argument("--non-interactive", action="store_true", help="Run in non-interactive mode, automatically retrying on errors without user prompts.")
+    parser.add_argument("--max-image-size", type=float, default=20.0, help="Maximum image size in MB to download (default: 20.0).")
     
     args = parser.parse_args()
 
@@ -608,7 +669,7 @@ if __name__ == "__main__":
         
         start_time = time.time()
         crawl_website(args.start_url, args.path_restriction_override, abs_output_folder, args.include_filter, args.exclude_filter, 
-                      args.page_workers, args.image_workers, args.request_delay, args.resume)
+                      args.page_workers, args.image_workers, args.request_delay, args.resume, args.non_interactive, args.max_image_size)
         end_time = time.time()
         print(f"Total execution time: {end_time - start_time:.2f} seconds.")
         print("Exiting.")
