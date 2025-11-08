@@ -21,7 +21,7 @@ import select
 import pickle
 import termios
 
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 60
 
 DEFAULT_OUTPUT_FOLDER = f"downloaded_images_{time.strftime('%Y%m%d_%H%M%S')}"
 DEFAULT_PAGE_WORKERS = 20
@@ -110,7 +110,7 @@ def sanitize_filename(name_part):
     return name_part[:50]
 
 def set_user_agent(config):
-    chrome_major_version = random.randint(130, 137)
+    chrome_major_version = random.randint(138, 141)
     config.session.headers.update({"User-Agent": f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_major_version}.0.0.0.0 Safari/537.36"})
 
 def set_image_metadata_piexif(image_path, description, source_url):
