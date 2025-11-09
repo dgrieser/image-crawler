@@ -1,1 +1,4 @@
 downloaded_images_*
+downloaded_images*
+test_run/
+crawl_state.pkl
