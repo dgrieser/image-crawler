@@ -553,18 +553,40 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                 for url in failed_urls_to_retry:
                     config.pages_to_crawl_queue.append(url)
 
-                # Adjust delay and request limits
-                config.request_delay *= 1.1
-                config.min_request_delay *= 1.1
-                config.long_request_delay = int(config.long_request_delay * 1.1)
-                config.max_fast_requests = max(1, int(config.max_fast_requests * 0.9))
-                config.max_requests = max(1, int(config.max_requests * 0.9))
-                print(f"--- Adjusted config: request_delay={config.request_delay:.2f}, min_request_delay={config.min_request_delay:.2f}, long_request_delay={config.long_request_delay}, max_fast_requests={config.max_fast_requests}, max_requests={config.max_requests} ---")
+                while True: # Test-and-re-pause loop
+                    # Adjust delay and request limits
+                    config.request_delay *= 1.1
+                    config.min_request_delay *= 1.1
+                    config.long_request_delay = int(config.long_request_delay * 1.1)
+                    config.max_fast_requests = max(1, int(config.max_fast_requests * 0.9))
+                    config.max_requests = max(1, int(config.max_requests * 0.9))
+                    print(f"--- Adjusted config: request_delay={config.request_delay:.2f}, min_request_delay={config.min_request_delay:.2f}, long_request_delay={config.long_request_delay}, max_fast_requests={config.max_fast_requests}, max_requests={config.max_requests} ---")
 
-                save_state(config)
-                random_global_delay = random.uniform(MIN_GLOBAL_DELAY, MAX_GLOBAL_DELAY)
-                print(f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. Pausing for {random_global_delay} seconds. ---")
-                time.sleep(random_global_delay)
+                    # Clear session data
+                    config.session.close()
+                    config.session = requests.Session()
+                    set_user_agent(config)
+
+                    save_state(config)
+
+                    if not failed_urls_to_retry:
+                        print("--- No failed URLs to test, resuming crawl. ---")
+                        break
+
+                    test_url = random.choice(list(failed_urls_to_retry))
+
+                    random_global_delay = random.uniform(MIN_GLOBAL_DELAY, MAX_GLOBAL_DELAY)
+                    print(f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. Pausing for {random_global_delay:.2f} seconds. ---")
+                    time.sleep(random_global_delay)
+
+                    print(f"--- Paused. Testing connectivity with {test_url} before resuming. ---")
+                    try:
+                        head_response = config.session.head(test_url, timeout=TIMEOUT_SECONDS)
+                        head_response.raise_for_status()
+                        print(f"--- Connectivity test successful. Resuming crawl. ---")
+                        break  # Exit the pause loop
+                    except requests.exceptions.RequestException as e:
+                        print(f"--- Connectivity test failed: {e}. Re-pausing. ---")
 
                 failed_urls_to_retry.clear()
 
