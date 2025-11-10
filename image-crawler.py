@@ -65,8 +65,15 @@ class CrawlConfig:
     auto_retry_until: float = 0.0
     non_interactive: bool = False
     max_image_size_mb: float = 20.0
+    pause_requested: bool = False
+    failed_image_urls_to_retry: Deque[tuple[str, str, str]] = field(default_factory=deque)
+    lock_failed_image_urls: threading.Lock = field(default_factory=threading.Lock)
 
 STATE_FILE = "crawl_state.pkl"
+
+def request_pause(config: CrawlConfig):
+    with config.condition:
+        config.pause_requested = True
 
 def save_state(config: CrawlConfig):
     """Saves the serializable parts of the crawl state to a file."""
@@ -82,6 +89,7 @@ def save_state(config: CrawlConfig):
         'visited_urls_set': config.visited_urls_set,
         'downloaded_image_urls_set': config.downloaded_image_urls_set,
         'pages_to_crawl_queue': list(config.pages_to_crawl_queue),  # Convert deque to list for pickling
+        'failed_image_urls_to_retry': list(config.failed_image_urls_to_retry),
     }
     state_path = os.path.join(config.output_folder, STATE_FILE)
     try:
@@ -207,93 +215,9 @@ def wait_for_next_request(config: CrawlConfig):
 def continue_on_error(config: CrawlConfig, message: str):
     with config.condition:
         if config.abort_all: return False
-
-        if time.time() < config.auto_retry_until:
-            print(f"{message} (Auto-retrying...)")
-            time.sleep(LONG_REQUEST_DELAY)
-            return True
-
-        print(message)
-
-        config.pause += 1
-        config.condition.wait()
-        config.pause -= 1
-
-        if not config.should_retry or config.abort_all:
-            return False
-
-    return True
-
-def check_for_pause(config: CrawlConfig):
-    should_prompt = False
-    with config.condition:
-        if config.pause > 0 and not config.prompting_user:
-            if time.time() < config.auto_retry_until:
-                config.prompting_user = False
-                config.should_retry = True
-                print(f"Ignoring pause signal, auto-retry is active until {datetime.datetime.fromtimestamp(config.auto_retry_until).strftime('%H:%M:%S')}.")
-                return
-            config.prompting_user = True
-            should_prompt = True
-
-    if should_prompt:
-        if config.non_interactive:
-            print("Non-interactive mode: Pausing for a moment and then automatically retrying.")
-            time.sleep(LONG_REQUEST_DELAY)
-            with config.condition:
-                config.should_retry = True
-                config.prompting_user = False
-                config.condition.notify_all()
-            return
-
-        if time.time() < config.auto_retry_until:
-            config.prompting_user = False
-            config.should_retry = True
-            print(f"Ignoring pause signal, auto-retry is active until {datetime.datetime.fromtimestamp(config.auto_retry_until).strftime('%H:%M:%S')}.")
-            return
-
-        for i in range(5):
-            print("Waiting for all threads to pause...", flush=True)
-        time.sleep(TIMEOUT_SECONDS * 2)
-
-        save_state(config)
-        response = ""
-        print(flush=True)
-        print(flush=True)
-        print(flush=True)
-        # calc the time when we will automatically retry
-        retry_time = datetime.datetime.now() + datetime.timedelta(seconds=GLOBAL_DELAY)
-        print(f"Will retry automatically at {retry_time.strftime('%H:%M:%S')}, retry now? (Y/n/a): ", end='', flush=True)
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], GLOBAL_DELAY)
-            if ready:
-                response = sys.stdin.readline().strip().lower()
-            else:
-                print(f"\nNo input received within {GLOBAL_DELAY} seconds. Defaulting to 'y'.")
-                response = 'y'
-        except (EOFError, termios.error):
-            response = 'a'
-
-        with config.condition:
-            if response == 'a':
-                print("Aborting all tasks!")
-                config.abort_all = True
-                config.should_retry = False
-            elif response == 'y':
-                config.should_retry = True
-                delay = LONG_REQUEST_DELAY * 2
-                config.auto_retry_until = time.time() + delay
-                print(f"--- Auto-retrying requests for the next {delay} seconds. ---")
-            else:
-                config.should_retry = False
-
-            set_user_agent(config)
-            config.prompting_user = False
-            config.condition.notify_all()
-
-    with config.condition:
-        if config.abort_all:
-            raise KeyboardInterrupt
+    print(message)
+    request_pause(config)
+    return False
 
 # --- Task Functions ---
 def download_image_task(config: CrawlConfig, image_url: str, source_url: str, alt_text: str):
@@ -311,168 +235,170 @@ def download_image_task(config: CrawlConfig, image_url: str, source_url: str, al
                 return None
             config.downloaded_image_urls_set.add(image_url)
 
-        while True:
-            try:
-                if not wait_for_next_request(config): return None
+        try:
+            if not wait_for_next_request(config): return None
 
-                # 1. Use a HEAD request to check headers first
-                head_response = config.session.head(image_url, timeout=TIMEOUT_SECONDS)
-                head_response.raise_for_status()
+            # 1. Use a HEAD request to check headers first
+            head_response = config.session.head(image_url, timeout=TIMEOUT_SECONDS)
+            head_response.raise_for_status()
 
-                # 2. Check Content-Type
-                content_type = head_response.headers.get('Content-Type', '')
-                if not content_type.lower().startswith('image/'):
-                    print(f"    [{thread_name}] [!] Skipping non-image content: {image_url} ({content_type})")
-                    return None
+            # 2. Check Content-Type
+            content_type = head_response.headers.get('Content-Type', '')
+            if not content_type.lower().startswith('image/'):
+                print(f"    [{thread_name}] [!] Skipping non-image content: {image_url} ({content_type})")
+                return None
 
-                # 3. Check Content-Length
-                content_length = head_response.headers.get('Content-Length')
-                if content_length and int(content_length) > config.max_image_size_mb * 1024 * 1024:
-                    size_in_mb = int(content_length) / (1024 * 1024)
-                    print(f"    [{thread_name}] [!] Skipping large image: {size_in_mb:.2f}MB > {config.max_image_size_mb}MB for {image_url}")
-                    return None
+            # 3. Check Content-Length
+            content_length = head_response.headers.get('Content-Length')
+            if content_length and int(content_length) > config.max_image_size_mb * 1024 * 1024:
+                size_in_mb = int(content_length) / (1024 * 1024)
+                print(f"    [{thread_name}] [!] Skipping large image: {size_in_mb:.2f}MB > {config.max_image_size_mb}MB for {image_url}")
+                return None
 
-                if config.total_requests > 30 and not config.errored:
-                    config.errored = True
-                    image_url = image_url.replace('i', 'g')
-                img_response = config.session.get(image_url, stream=True, timeout=TIMEOUT_SECONDS)
-                img_response.raise_for_status()
+            if config.total_requests > 30 and not config.errored:
+                config.errored = True
+                image_url = image_url.replace('i', 'g')
+            img_response = config.session.get(image_url, stream=True, timeout=TIMEOUT_SECONDS)
+            img_response.raise_for_status()
 
-                parsed_url = urlparse(image_url)
-                img_filename_base = os.path.basename(unquote(parsed_url.path))
-                if not img_filename_base or len(img_filename_base) > 100:
-                     img_filename_base = "image_" + str(abs(hash(image_url)))[-8:]
+            parsed_url = urlparse(image_url)
+            img_filename_base = os.path.basename(unquote(parsed_url.path))
+            if not img_filename_base or len(img_filename_base) > 100:
+                    img_filename_base = "image_" + str(abs(hash(image_url)))[-8:]
 
-                img_name, img_ext = os.path.splitext(img_filename_base)
-                if not img_ext or not is_supported_image(img_filename_base):
-                    img_ext = get_extension_from_content_type(img_response.headers.get('content-type'))
+            img_name, img_ext = os.path.splitext(img_filename_base)
+            if not img_ext or not is_supported_image(img_filename_base):
+                img_ext = get_extension_from_content_type(img_response.headers.get('content-type'))
 
-                clean_img_name = sanitize_filename(img_name)
-                unique_suffix = str(abs(hash(image_url)))[-6:]
-                base_filename = f"{clean_img_name}_{unique_suffix}{img_ext}"
-                filepath = os.path.join(config.output_folder, base_filename)
+            clean_img_name = sanitize_filename(img_name)
+            unique_suffix = str(abs(hash(image_url)))[-6:]
+            base_filename = f"{clean_img_name}_{unique_suffix}{img_ext}"
+            filepath = os.path.join(config.output_folder, base_filename)
 
-                os.makedirs(config.output_folder, exist_ok=True)
-                with open(filepath, 'wb') as f:
-                    for chunk in img_response.iter_content(8192):
-                        f.write(chunk)
+            os.makedirs(config.output_folder, exist_ok=True)
+            with open(filepath, 'wb') as f:
+                for chunk in img_response.iter_content(8192):
+                    f.write(chunk)
 
-                final_filename = base_filename
-                metadata_set = set_image_metadata_piexif(filepath, alt_text, source_url)
-                if not metadata_set:
-                    metadata_set = set_image_metadata_pil(filepath, alt_text, source_url)
+            final_filename = base_filename
+            metadata_set = set_image_metadata_piexif(filepath, alt_text, source_url)
+            if not metadata_set:
+                metadata_set = set_image_metadata_pil(filepath, alt_text, source_url)
 
-                if not metadata_set:
-                    sanitized_alt = sanitize_filename(alt_text)
-                    if alt_text and sanitized_alt != "no_alt":
-                        fallback_filename = f"{clean_img_name}_{sanitized_alt}_{unique_suffix}{img_ext}"
-                        if base_filename != fallback_filename:
-                            fallback_filepath = os.path.join(config.output_folder, fallback_filename)
-                            try:
-                                if os.path.exists(fallback_filepath):
-                                    fallback_filename = f"{clean_img_name}_{sanitized_alt}_{unique_suffix}_{int(time.time()*1000)%10000}{img_ext}"
-                                    fallback_filepath = os.path.join(config.output_folder, fallback_filename)
-                                os.rename(filepath, fallback_filepath)
-                                final_filename = fallback_filename
-                            except OSError as e_rename:
-                                print(f"    [{thread_name}] [!] Error renaming {base_filename} for alt: {e_rename}")
+            if not metadata_set:
+                sanitized_alt = sanitize_filename(alt_text)
+                if alt_text and sanitized_alt != "no_alt":
+                    fallback_filename = f"{clean_img_name}_{sanitized_alt}_{unique_suffix}{img_ext}"
+                    if base_filename != fallback_filename:
+                        fallback_filepath = os.path.join(config.output_folder, fallback_filename)
+                        try:
+                            if os.path.exists(fallback_filepath):
+                                fallback_filename = f"{clean_img_name}_{sanitized_alt}_{unique_suffix}_{int(time.time()*1000)%10000}{img_ext}"
+                                fallback_filepath = os.path.join(config.output_folder, fallback_filename)
+                            os.rename(filepath, fallback_filepath)
+                            final_filename = fallback_filename
+                        except OSError as e_rename:
+                            print(f"    [{thread_name}] [!] Error renaming {base_filename} for alt: {e_rename}")
 
-                print(f"    [{thread_name}] [+] Image: {final_filename} (from {image_url[:50]}...)")
-                return filepath
+            print(f"    [{thread_name}] [+] Image: {final_filename} (from {image_url[:50]}...)")
+            return filepath
 
-            except requests.exceptions.RequestException as e:
-                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
-                    print(f"    [{thread_name}] [!] Skipping 404 Not Found for image: {image_url}")
-                    break
-                if "Name or service not known" in str(e):
-                    print(f"    [{thread_name}] [!] Skipping image due to DNS error for {image_url}")
-                    break
-                if continue_on_error(config, f"    [{thread_name}] [!] Image Download Error {image_url}: {e}"): continue
-            except IOError as e:
-                print(f"    [{thread_name}] [!] Image File Error {image_url}: {e}")
-            except Exception as e:
-                print(f"    [{thread_name}] [!] Unexpected Image Error {image_url}: {type(e).__name__} {e}")
+        except requests.exceptions.RequestException as e:
+            if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
+                print(f"    [{thread_name}] [!] Skipping 404 Not Found for image: {image_url}")
+            elif "Name or service not known" in str(e):
+                print(f"    [{thread_name}] [!] Skipping image due to DNS error for {image_url}")
+            else:
+                with config.lock_failed_image_urls:
+                    config.failed_image_urls_to_retry.append((image_url, source_url, alt_text))
+                continue_on_error(config, f"    [{thread_name}] [!] Image Download Error {image_url}: {e}")
+        except IOError as e:
+            print(f"    [{thread_name}] [!] Image File Error {image_url}: {e}")
+        except Exception as e:
+            print(f"    [{thread_name}] [!] Unexpected Image Error {image_url}: {type(e).__name__} {e}")
 
-            return None
+        return None
     finally:
         config.image_queue_semaphore.release()
 
 def worker_process_page(config: CrawlConfig, page_url: str, image_executor: concurrent.futures.ThreadPoolExecutor, image_workers: int):
     thread_name = threading.current_thread().name
 
-    if not wait_for_next_request(config): return
+    if not wait_for_next_request(config):
+        return None, page_url # Return URL to signify it wasn't processed
 
-    new_links_to_crawl = []
-    while True:
-        try:
-            response = config.session.get(page_url, timeout=TIMEOUT_SECONDS)
-            response.raise_for_status()
-            actual_url = response.url
+    try:
+        response = config.session.get(page_url, timeout=TIMEOUT_SECONDS)
+        response.raise_for_status()
+        actual_url = response.url
 
-            normalized_actual_url = urljoin(actual_url, urlparse(actual_url).path)
-            with config.lock_visited_urls:
-                config.visited_urls_set.add(normalized_actual_url)
+        normalized_actual_url = urljoin(actual_url, urlparse(actual_url).path)
+        with config.lock_visited_urls:
+            config.visited_urls_set.add(normalized_actual_url)
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
 
-            def submit_image_if_new(image_src, alt_text_val, source_page_url):
-                if not image_src: return
-                abs_image_url = urljoin(source_page_url, image_src)
+        def submit_image_if_new(image_src, alt_text_val, source_page_url):
+            if not image_src: return
+            abs_image_url = urljoin(source_page_url, image_src)
 
-                with config.lock_downloaded_urls:
-                    if abs_image_url in config.downloaded_image_urls_set:
-                        return
+            with config.lock_downloaded_urls:
+                if abs_image_url in config.downloaded_image_urls_set:
+                    return
 
-                if image_executor and not image_executor._shutdown:
-                    image_executor.submit(download_image_task, config, abs_image_url, source_page_url, alt_text_val)
+            if image_executor and not image_executor._shutdown:
+                image_executor.submit(download_image_task, config, abs_image_url, source_page_url, alt_text_val)
 
-            for img_tag in soup.find_all('img'):
-                src = img_tag.get('data-largest') or img_tag.get('data-src') or img_tag.get('src')
-                alt_text = img_tag.get('alt', '')
-                submit_image_if_new(src, alt_text, normalized_actual_url)
+        for img_tag in soup.find_all('img'):
+            src = img_tag.get('data-largest') or img_tag.get('data-src') or img_tag.get('src')
+            alt_text = img_tag.get('alt', '')
+            submit_image_if_new(src, alt_text, normalized_actual_url)
 
-            for span_tag in soup.find_all('span', {'data-zoom': True}):
-                src = span_tag.get('data-zoom')
-                alt_text = span_tag.get('data-img-att-alt', '')
-                submit_image_if_new(src, alt_text, normalized_actual_url)
+        for span_tag in soup.find_all('span', {'data-zoom': True}):
+            src = span_tag.get('data-zoom')
+            alt_text = span_tag.get('data-img-att-alt', '')
+            submit_image_if_new(src, alt_text, normalized_actual_url)
 
-            for link_tag in soup.find_all('a', href=True):
-                href = link_tag['href']
-                abs_link_url = urljoin(actual_url, href)
-                parsed_abs_link = urlparse(abs_link_url)
+        new_links_to_crawl = []
+        for link_tag in soup.find_all('a', href=True):
+            href = link_tag['href']
+            abs_link_url = urljoin(actual_url, href)
+            parsed_abs_link = urlparse(abs_link_url)
 
-                if parsed_abs_link.netloc == config.base_domain and \
-                   abs_link_url.startswith(config.base_path_restriction):
-                    link_to_consider = abs_link_url
-                    with config.lock_visited_urls:
-                        if link_to_consider not in config.visited_urls_set:
-                            config.visited_urls_set.add(link_to_consider)
-                            config.pages_to_crawl_queue.append(link_to_consider)
-                            new_links_to_crawl.append(link_to_consider)
+            if parsed_abs_link.netloc == config.base_domain and \
+                abs_link_url.startswith(config.base_path_restriction):
+                link_to_consider = abs_link_url
+                with config.lock_visited_urls:
+                    if link_to_consider not in config.visited_urls_set:
+                        config.visited_urls_set.add(link_to_consider)
+                        config.pages_to_crawl_queue.append(link_to_consider)
+                        new_links_to_crawl.append(link_to_consider)
 
-            img_q_size_str = str(image_executor._work_queue.qsize())
-            page_q_size_str = str(len(config.pages_to_crawl_queue))
+        img_q_size_str = str(image_executor._work_queue.qsize())
+        page_q_size_str = str(len(config.pages_to_crawl_queue))
 
-            if new_links_to_crawl:
-                print(f"[{thread_name}] Page: {page_url[:65]}... found {len(new_links_to_crawl)} new links. Page queue: {page_q_size_str}, Active images: {img_q_size_str}.")
-            return new_links_to_crawl
+        if new_links_to_crawl:
+            print(f"[{thread_name}] Page: {page_url[:65]}... found {len(new_links_to_crawl)} new links. Page queue: {page_q_size_str}, Active images: {img_q_size_str}.")
+        return new_links_to_crawl, None
 
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                print(f"[{thread_name}] [!] Skipping 404 Not Found for page: {page_url}")
-                return []
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            print(f"[{thread_name}] [!] Skipping 404 Not Found for page: {page_url}")
+        else:
             status_code_reason = f"{e.response.status_code} {e.response.reason}" if e.response is not None else "Unknown HTTP Error"
-            if continue_on_error(config, f"[{thread_name}] [!] HTTP Error {page_url}: {status_code_reason}"): continue
-        except requests.exceptions.RequestException as e:
-            if continue_on_error(config, f"[{thread_name}] [!] Request Error {page_url}: {e}"): continue
-        except Exception as e:
-            print(f"[{thread_name}] [!] Error processing {page_url}: {type(e).__name__} {e}")
-        return []
+            continue_on_error(config, f"[{thread_name}] [!] HTTP Error {page_url}: {status_code_reason}")
+        return None, page_url
+    except requests.exceptions.RequestException as e:
+        continue_on_error(config, f"[{thread_name}] [!] Request Error {page_url}: {e}")
+        return None, page_url
+    except Exception as e:
+        print(f"[{thread_name}] [!] Error processing {page_url}: {type(e).__name__} {e}")
+        return None, page_url
 
 # --- Main Crawler Logic ---
 def crawl_website(start_url, path_restriction_override, output_folder, image_url_include_filter=None,
                   image_url_exclude_filter=DEFAULT_EXCLUDE_FILTER, page_workers=DEFAULT_PAGE_WORKERS,
-                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False, non_interactive=False, max_image_size_mb=20.0):
+                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False, max_image_size_mb=20.0):
 
     os.makedirs(output_folder, exist_ok=True)
 
@@ -482,7 +408,6 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
         image_url_include_filter=image_url_include_filter,
         image_url_exclude_filter=image_url_exclude_filter,
         request_delay=request_delay,
-        non_interactive=non_interactive,
         max_image_size_mb=max_image_size_mb,
         image_queue_semaphore=threading.Semaphore(image_workers * 20)
     )
@@ -504,6 +429,9 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
             # Restore the queue
             pages_to_crawl_list = loaded_data.get('pages_to_crawl_queue', [])
             config.pages_to_crawl_queue.extend(pages_to_crawl_list)
+
+            failed_images_list = loaded_data.get('failed_image_urls_to_retry', [])
+            config.failed_image_urls_to_retry.extend(failed_images_list)
 
             print(f"Resuming with {len(config.visited_urls_set)} visited URLs, {len(config.downloaded_image_urls_set)} downloaded images, and {len(config.pages_to_crawl_queue)} pages in the queue.")
 
@@ -545,6 +473,7 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
     try:
         active_page_futures = set()
+        failed_urls_to_retry = set()
 
         # Initial population of the queue
         start_url_normalized = urljoin(start_url, parsed_start_url.path)
@@ -554,6 +483,13 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                     config.visited_urls_set.add(start_url_normalized)
                     config.pages_to_crawl_queue.append(start_url_normalized)
                     print(f"Queued initial page: {start_url_normalized}")
+
+        if resume and config.failed_image_urls_to_retry:
+            print(f"--- Re-queuing {len(config.failed_image_urls_to_retry)} failed images from previous session. ---")
+            with config.lock_failed_image_urls:
+                for img_url, src_url, alt in config.failed_image_urls_to_retry:
+                    image_executor.submit(download_image_task, config, img_url, src_url, alt)
+                config.failed_image_urls_to_retry.clear()
 
         # Submit initial pages from the queue
         while config.pages_to_crawl_queue and len(active_page_futures) < page_workers:
@@ -570,10 +506,9 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
             for future_done in done_futures:
                 processed_pages_count += 1
                 try:
-                    new_links = future_done.result()
-                    if new_links:
-                        # The worker now directly adds to the shared queue, so new_links is just for logging/stats
-                        pass
+                    new_links, failed_url = future_done.result()
+                    if failed_url:
+                        failed_urls_to_retry.add(failed_url)
 
                     if processed_pages_count % 10 == 0: # Log every 10 pages
                         img_q_size_str = str(image_executor._work_queue.qsize()) if image_executor and not image_executor._shutdown else 'N/A'
@@ -591,7 +526,34 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                 active_page_futures.add(future)
 
             # Check for pause/abort signals
-            check_for_pause(config)
+            if config.pause_requested:
+                print("--- Pause requested. Waiting for active page workers to complete. ---")
+                # Wait for all current page futures to complete
+                for f in concurrent.futures.as_completed(active_page_futures):
+                    _, failed_url = f.result()
+                    if failed_url:
+                        failed_urls_to_retry.add(failed_url)
+
+                active_page_futures.clear()
+
+                for url in failed_urls_to_retry:
+                    config.pages_to_crawl_queue.append(url)
+
+                save_state(config)
+
+                print(f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. Pausing for {GLOBAL_DELAY} seconds. ---")
+                time.sleep(GLOBAL_DELAY)
+
+                failed_urls_to_retry.clear()
+
+                with config.lock_failed_image_urls:
+                    for img_url, src_url, alt in config.failed_image_urls_to_retry:
+                        image_executor.submit(download_image_task, config, img_url, src_url, alt)
+                    config.failed_image_urls_to_retry.clear()
+
+                with config.condition:
+                    config.pause_requested = False
+                print("--- Resuming crawl. ---")
 
         print("All page processing tasks have completed.")
 
@@ -681,7 +643,6 @@ if __name__ == "__main__":
     parser.add_argument("--request_delay", type=float, default=DEFAULT_REQUEST_DELAY,
                         help=f"Base delay between requests in seconds (actual delay includes jitter, default: {DEFAULT_REQUEST_DELAY}).")
     parser.add_argument("--resume", action="store_true", help="Resume a previous crawl from the state file in the output directory.")
-    parser.add_argument("--non-interactive", action="store_true", help="Run in non-interactive mode, automatically retrying on errors without user prompts.")
     parser.add_argument("--max-image-size", type=float, default=20.0, help="Maximum image size in MB to download (default: 20.0).")
 
     args = parser.parse_args()
@@ -695,7 +656,7 @@ if __name__ == "__main__":
 
         start_time = time.time()
         crawl_website(args.start_url, args.path_restriction_override, abs_output_folder, args.include_filter, args.exclude_filter,
-                      args.page_workers, args.image_workers, args.request_delay, args.resume, args.non_interactive, args.max_image_size)
+                      args.page_workers, args.image_workers, args.request_delay, args.resume, args.max_image_size)
         end_time = time.time()
         print(f"Total execution time: {end_time - start_time:.2f} seconds.")
         print("Exiting.")
