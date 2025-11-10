@@ -32,7 +32,8 @@ MIN_REQUEST_DELAY = 0.18
 MAX_FAST_REQUESTS = 47
 MAX_REQUESTS = 187
 LONG_REQUEST_DELAY = 31
-GLOBAL_DELAY = 300
+MIN_GLOBAL_DELAY = 300
+MAX_GLOBAL_DELAY = 600
 
 CHROME_VERSION = "141.0.0.0"
 
@@ -540,9 +541,9 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                     config.pages_to_crawl_queue.append(url)
 
                 save_state(config)
-
-                print(f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. Pausing for {GLOBAL_DELAY} seconds. ---")
-                time.sleep(GLOBAL_DELAY)
+                random_global_delay = random.uniform(MIN_GLOBAL_DELAY, MAX_GLOBAL_DELAY)
+                print(f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. Pausing for {random_global_delay} seconds. ---")
+                time.sleep(random_global_delay)
 
                 failed_urls_to_retry.clear()
 
