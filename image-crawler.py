@@ -47,6 +47,11 @@ class CrawlConfig:
     total_requests: int = 0
     errored: bool = False
 
+    min_request_delay: float = MIN_REQUEST_DELAY
+    max_fast_requests: int = MAX_FAST_REQUESTS
+    max_requests: int = MAX_REQUESTS
+    long_request_delay: int = LONG_REQUEST_DELAY
+
     base_domain: str = ""
     base_path_restriction: str = ""
 
@@ -84,6 +89,10 @@ def save_state(config: CrawlConfig):
         'image_url_include_filter': config.image_url_include_filter,
         'image_url_exclude_filter': config.image_url_exclude_filter,
         'request_delay': config.request_delay,
+        'min_request_delay': config.min_request_delay,
+        'max_fast_requests': config.max_fast_requests,
+        'max_requests': config.max_requests,
+        'long_request_delay': config.long_request_delay,
         'total_requests': config.total_requests,
         'base_domain': config.base_domain,
         'base_path_restriction': config.base_path_restriction,
@@ -199,17 +208,17 @@ def wait_for_next_request(config: CrawlConfig):
     if config.request_delay > 0:
         with config.lock_delay:
             config.total_requests += 1
-            if config.total_requests % MAX_REQUESTS == 0:
-                time.sleep(LONG_REQUEST_DELAY)
-            elif config.total_requests % MAX_FAST_REQUESTS != 0:
-                time.sleep(MIN_REQUEST_DELAY)
+            if config.total_requests % config.max_requests == 0:
+                time.sleep(config.long_request_delay)
+            elif config.total_requests % config.max_fast_requests != 0:
+                time.sleep(config.min_request_delay)
             else:
-                min_r_delay = min(MIN_REQUEST_DELAY, config.request_delay * 0.9)
+                min_r_delay = min(config.min_request_delay, config.request_delay * 0.9)
                 max_r_delay = config.request_delay * 1.1
                 random_actual_delay = random.uniform(min_r_delay, max_r_delay)
                 time.sleep(random_actual_delay)
     else:
-        time.sleep(MIN_REQUEST_DELAY)
+        time.sleep(config.min_request_delay)
 
     return True
 
@@ -421,6 +430,10 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
             config.image_url_include_filter = loaded_data.get('image_url_include_filter', config.image_url_include_filter)
             config.image_url_exclude_filter = loaded_data.get('image_url_exclude_filter', config.image_url_exclude_filter)
             config.request_delay = loaded_data.get('request_delay', config.request_delay)
+            config.min_request_delay = loaded_data.get('min_request_delay', config.min_request_delay)
+            config.max_fast_requests = loaded_data.get('max_fast_requests', config.max_fast_requests)
+            config.max_requests = loaded_data.get('max_requests', config.max_requests)
+            config.long_request_delay = loaded_data.get('long_request_delay', config.long_request_delay)
             config.total_requests = loaded_data.get('total_requests', config.total_requests)
             config.base_domain = loaded_data.get('base_domain', config.base_domain)
             config.base_path_restriction = loaded_data.get('base_path_restriction', config.base_path_restriction)
@@ -539,6 +552,14 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
                 for url in failed_urls_to_retry:
                     config.pages_to_crawl_queue.append(url)
+
+                # Adjust delay and request limits
+                config.request_delay *= 1.1
+                config.min_request_delay *= 1.1
+                config.long_request_delay = int(config.long_request_delay * 1.1)
+                config.max_fast_requests = max(1, int(config.max_fast_requests * 0.9))
+                config.max_requests = max(1, int(config.max_requests * 0.9))
+                print(f"--- Adjusted config: request_delay={config.request_delay:.2f}, min_request_delay={config.min_request_delay:.2f}, long_request_delay={config.long_request_delay}, max_fast_requests={config.max_fast_requests}, max_requests={config.max_requests} ---")
 
                 save_state(config)
                 random_global_delay = random.uniform(MIN_GLOBAL_DELAY, MAX_GLOBAL_DELAY)
