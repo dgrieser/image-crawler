@@ -555,6 +555,12 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                     config.pause_requested = False
                 print("--- Resuming crawl. ---")
 
+                # Repopulate active futures to continue the main loop
+                while config.pages_to_crawl_queue and len(active_page_futures) < page_workers:
+                    page_url = config.pages_to_crawl_queue.popleft()
+                    future = page_executor.submit(worker_process_page, config, page_url, image_executor, image_workers)
+                    active_page_futures.add(future)
+
         print("All page processing tasks have completed.")
 
         page_executor.shutdown(wait=True)
