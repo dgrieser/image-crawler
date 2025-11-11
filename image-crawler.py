@@ -620,11 +620,11 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
                 while True: # Test-and-re-pause loop
                     # Adjust delay and request limits
-                    config.request_delay *= 1.1
-                    config.min_request_delay *= 1.1
-                    config.long_request_delay = int(config.long_request_delay * 1.1)
-                    config.max_fast_requests = max(1, int(config.max_fast_requests * 0.9))
-                    config.max_requests = max(1, int(config.max_requests * 0.9))
+                    config.request_delay *= 1.01
+                    config.min_request_delay *= 1.01
+                    config.long_request_delay = int(config.long_request_delay * 1.01)
+                    config.max_fast_requests = max(1, int(config.max_fast_requests * 0.99))
+                    config.max_requests = max(1, int(config.max_requests * 0.99))
                     print(f"--- Adjusted config: request_delay={config.request_delay:.2f}, min_request_delay={config.min_request_delay:.2f}, long_request_delay={config.long_request_delay}, max_fast_requests={config.max_fast_requests}, max_requests={config.max_requests} ---")
 
                     # Clear session data
