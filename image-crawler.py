@@ -7,6 +7,7 @@ import argparse
 import requests
 import piexif
 import random
+import json
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, unquote
 from PIL import Image
@@ -75,14 +76,63 @@ class CrawlConfig:
     failed_image_urls_to_retry: Deque[tuple[str, str, str]] = field(default_factory=deque)
     lock_failed_image_urls: threading.Lock = field(default_factory=threading.Lock)
 
-STATE_FILE = "crawl_state.pkl"
+STATE_JSON_FILE = "crawl_state.json"
+STATE_PICKLE_FILE = "crawl_state.pkl"
+
+
+def _state_to_json_serializable(state: dict) -> dict:
+    """Returns a JSON-serializable copy of the crawl state."""
+    serializable_state = dict(state)
+
+    if isinstance(serializable_state.get('visited_urls_set'), set):
+        serializable_state['visited_urls_set'] = list(serializable_state['visited_urls_set'])
+    if isinstance(serializable_state.get('downloaded_image_urls_set'), set):
+        serializable_state['downloaded_image_urls_set'] = list(serializable_state['downloaded_image_urls_set'])
+    if isinstance(serializable_state.get('pages_to_crawl_queue'), deque):
+        serializable_state['pages_to_crawl_queue'] = list(serializable_state['pages_to_crawl_queue'])
+    if isinstance(serializable_state.get('failed_image_urls_to_retry'), deque):
+        serializable_state['failed_image_urls_to_retry'] = list(serializable_state['failed_image_urls_to_retry'])
+
+    return serializable_state
+
+
+def _normalize_loaded_state(state: dict) -> dict:
+    """Converts JSON-friendly containers back to their runtime counterparts."""
+    if state is None:
+        return None
+
+    visited = state.get('visited_urls_set')
+    if visited is not None and not isinstance(visited, set):
+        state['visited_urls_set'] = set(visited)
+
+    downloaded = state.get('downloaded_image_urls_set')
+    if downloaded is not None and not isinstance(downloaded, set):
+        state['downloaded_image_urls_set'] = set(downloaded)
+
+    pages = state.get('pages_to_crawl_queue')
+    if pages is not None and not isinstance(pages, deque):
+        state['pages_to_crawl_queue'] = deque(pages)
+
+    failed_images = state.get('failed_image_urls_to_retry')
+    if failed_images is not None and not isinstance(failed_images, deque):
+        state['failed_image_urls_to_retry'] = deque(tuple(item) for item in failed_images)
+
+    return state
+
+
+def _write_state_json(output_folder: str, state: dict) -> str:
+    state_path = os.path.join(output_folder, STATE_JSON_FILE)
+    serializable_state = _state_to_json_serializable(state)
+    with open(state_path, 'w') as f:
+        json.dump(serializable_state, f, indent=2)
+    return state_path
 
 def request_pause(config: CrawlConfig):
     with config.condition:
         config.pause_requested = True
 
 def save_state(config: CrawlConfig):
-    """Saves the serializable parts of the crawl state to a file."""
+    """Saves the serializable parts of the crawl state as JSON."""
     state = {
         'start_url': config.start_url,
         'output_folder': config.output_folder,
@@ -98,28 +148,43 @@ def save_state(config: CrawlConfig):
         'base_path_restriction': config.base_path_restriction,
         'visited_urls_set': config.visited_urls_set,
         'downloaded_image_urls_set': config.downloaded_image_urls_set,
-        'pages_to_crawl_queue': list(config.pages_to_crawl_queue),  # Convert deque to list for pickling
-        'failed_image_urls_to_retry': list(config.failed_image_urls_to_retry),
+        'pages_to_crawl_queue': config.pages_to_crawl_queue,
+        'failed_image_urls_to_retry': config.failed_image_urls_to_retry,
     }
-    state_path = os.path.join(config.output_folder, STATE_FILE)
     try:
-        with open(state_path, 'wb') as f:
-            pickle.dump(state, f)
+        state_path = _write_state_json(config.output_folder, state)
         print(f"--- State saved to {state_path} ---")
     except Exception as e:
         print(f"!!! Error saving state: {e}")
 
 def load_state(output_folder: str) -> Optional[dict]:
     """Loads the crawl state from a file."""
-    state_path = os.path.join(output_folder, STATE_FILE)
-    if os.path.exists(state_path):
+    json_state_path = os.path.join(output_folder, STATE_JSON_FILE)
+    pickle_state_path = os.path.join(output_folder, STATE_PICKLE_FILE)
+
+    if os.path.exists(json_state_path):
         try:
-            with open(state_path, 'rb') as f:
-                state = pickle.load(f)
-            print(f"--- State loaded from {state_path} ---")
-            return state
+            with open(json_state_path, 'r') as f:
+                state = json.load(f)
+            print(f"--- State loaded from {json_state_path} ---")
+            return _normalize_loaded_state(state)
         except Exception as e:
-            print(f"!!! Error loading state: {e}")
+            print(f"!!! Error loading JSON state: {e}")
+
+    if os.path.exists(pickle_state_path):
+        try:
+            with open(pickle_state_path, 'rb') as f:
+                state = pickle.load(f)
+            normalized_state = _normalize_loaded_state(state)
+            try:
+                converted_path = _write_state_json(output_folder, normalized_state)
+                print(f"--- Converted legacy pickle state to JSON at {converted_path} ---")
+            except Exception as convert_error:
+                print(f"!!! Unable to convert legacy pickle state to JSON: {convert_error}")
+            print(f"--- State loaded from {pickle_state_path} ---")
+            return normalized_state
+        except Exception as e:
+            print(f"!!! Error loading pickle state: {e}")
     return None
 
 def sanitize_filename(name_part):
