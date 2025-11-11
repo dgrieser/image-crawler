@@ -213,8 +213,8 @@ def wait_for_next_request(config: CrawlConfig):
             elif config.total_requests % config.max_fast_requests != 0:
                 time.sleep(config.min_request_delay)
             else:
-                min_r_delay = min(config.min_request_delay, config.request_delay * 0.9)
-                max_r_delay = config.request_delay * 1.1
+                min_r_delay = min(config.min_request_delay, config.request_delay * 0.99)
+                max_r_delay = config.request_delay * 1.01
                 random_actual_delay = random.uniform(min_r_delay, max_r_delay)
                 time.sleep(random_actual_delay)
     else:
