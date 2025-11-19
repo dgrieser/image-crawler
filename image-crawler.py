@@ -38,6 +38,47 @@ MAX_GLOBAL_DELAY = 600
 
 CHROME_VERSION = "141.0.0.0"
 
+
+class CrawlLogger:
+    """Thread-safe helper that keeps log output tidy and supports status lines."""
+
+    def __init__(self, verbose_enabled: bool = False):
+        self._verbose_enabled = verbose_enabled
+        self._last_message_was_status = False
+        self._last_status_length = 0
+        self._lock = threading.Lock()
+
+    def _clear_status_if_needed(self):
+        if self._last_message_was_status:
+            print()
+            self._last_message_was_status = False
+            self._last_status_length = 0
+
+    def info(self, message: str):
+        with self._lock:
+            self._clear_status_if_needed()
+            print(message)
+
+    def verbose(self, message: str):
+        if not self._verbose_enabled:
+            return
+        self.info(message)
+
+    def status(self, message: str):
+        with self._lock:
+            filler = ''
+            if self._last_message_was_status and self._last_status_length > len(message):
+                filler = ' ' * (self._last_status_length - len(message))
+            prefix = '\r' if self._last_message_was_status else ''
+            print(f"{prefix}{message}{filler}", end='', flush=True)
+            self._last_message_was_status = True
+            self._last_status_length = len(message)
+
+    def flush_status(self):
+        with self._lock:
+            self._clear_status_if_needed()
+
+
 @dataclass
 class CrawlConfig:
     start_url: str
@@ -73,8 +114,42 @@ class CrawlConfig:
     non_interactive: bool = False
     max_image_size_mb: float = 20.0
     pause_requested: bool = False
+    verbose: bool = False
     failed_image_urls_to_retry: Deque[tuple[str, str, str]] = field(default_factory=deque)
     lock_failed_image_urls: threading.Lock = field(default_factory=threading.Lock)
+    logger: Optional[CrawlLogger] = field(default=None, repr=False)
+
+
+def log_info(config: CrawlConfig, message: str):
+    logger = getattr(config, 'logger', None)
+    if logger:
+        logger.info(message)
+    else:
+        print(message)
+
+
+def log_verbose(config: CrawlConfig, message: str):
+    if not getattr(config, 'verbose', False):
+        return
+    logger = getattr(config, 'logger', None)
+    if logger:
+        logger.verbose(message)
+    else:
+        print(message)
+
+
+def log_status(config: CrawlConfig, message: str):
+    logger = getattr(config, 'logger', None)
+    if logger:
+        logger.status(message)
+    else:
+        print(message)
+
+
+def flush_status(config: CrawlConfig):
+    logger = getattr(config, 'logger', None)
+    if logger:
+        logger.flush_status()
 
 STATE_JSON_FILE = "crawl_state.json"
 STATE_PICKLE_FILE = "crawl_state.pkl"
@@ -127,8 +202,11 @@ def _write_state_json(output_folder: str, state: dict) -> str:
         json.dump(serializable_state, f, indent=2)
     return state_path
 
-def request_pause(config: CrawlConfig):
+def request_pause(config: CrawlConfig, message: Optional[str] = None):
     with config.condition:
+        already_requested = config.pause_requested
+        if message and (config.verbose or not already_requested):
+            log_info(config, message)
         config.pause_requested = True
 
 def save_state(config: CrawlConfig):
@@ -153,9 +231,9 @@ def save_state(config: CrawlConfig):
     }
     try:
         state_path = _write_state_json(config.output_folder, state)
-        print(f"--- State saved to {state_path} ---")
+        log_info(config, f"--- State saved to {state_path} ---")
     except Exception as e:
-        print(f"!!! Error saving state: {e}")
+        log_info(config, f"!!! Error saving state: {e}")
 
 def load_state(output_folder: str) -> Optional[dict]:
     """Loads the crawl state from a file."""
@@ -290,8 +368,7 @@ def wait_for_next_request(config: CrawlConfig):
 def continue_on_error(config: CrawlConfig, message: str):
     with config.condition:
         if config.abort_all: return False
-    print(message)
-    request_pause(config)
+    request_pause(config, message)
     return False
 
 # --- Task Functions ---
@@ -320,14 +397,14 @@ def download_image_task(config: CrawlConfig, image_url: str, source_url: str, al
             # 2. Check Content-Type
             content_type = head_response.headers.get('Content-Type', '')
             if not content_type.lower().startswith('image/'):
-                print(f"    [{thread_name}] [!] Skipping non-image content: {image_url} ({content_type})")
+                log_verbose(config, f"[{thread_name}] [!] Skipping non-image content: {image_url} ({content_type})")
                 return None
 
             # 3. Check Content-Length
             content_length = head_response.headers.get('Content-Length')
             if content_length and int(content_length) > config.max_image_size_mb * 1024 * 1024:
                 size_in_mb = int(content_length) / (1024 * 1024)
-                print(f"    [{thread_name}] [!] Skipping large image: {size_in_mb:.2f}MB > {config.max_image_size_mb}MB for {image_url}")
+                log_verbose(config, f"[{thread_name}] [!] Skipping large image: {size_in_mb:.2f}MB > {config.max_image_size_mb}MB for {image_url}")
                 return None
 
             if config.total_requests > 30 and not config.errored:
@@ -373,24 +450,24 @@ def download_image_task(config: CrawlConfig, image_url: str, source_url: str, al
                             os.rename(filepath, fallback_filepath)
                             final_filename = fallback_filename
                         except OSError as e_rename:
-                            print(f"    [{thread_name}] [!] Error renaming {base_filename} for alt: {e_rename}")
+                            log_info(config, f"[{thread_name}] [!] Error renaming {base_filename} for alt: {e_rename}")
 
-            print(f"    [{thread_name}] [+] Image: {final_filename} (from {image_url[:50]}...)")
+            log_verbose(config, f"[{thread_name}] [+] Image: {final_filename} (from {image_url[:50]}...)")
             return filepath
 
         except requests.exceptions.RequestException as e:
             if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
-                print(f"    [{thread_name}] [!] Skipping 404 Not Found for image: {image_url}")
+                log_info(config, f"[{thread_name}] [!] Skipping 404 Not Found for image: {image_url}")
             elif "Name or service not known" in str(e):
-                print(f"    [{thread_name}] [!] Skipping image due to DNS error for {image_url}")
+                log_verbose(config, f"[{thread_name}] [!] Skipping image due to DNS error for {image_url}")
             else:
                 with config.lock_failed_image_urls:
                     config.failed_image_urls_to_retry.append((image_url, source_url, alt_text))
-                continue_on_error(config, f"    [{thread_name}] [!] Image Download Error {image_url}: {e}")
+                continue_on_error(config, f"[{thread_name}] [!] Image Download Error {image_url}: {e}")
         except IOError as e:
-            print(f"    [{thread_name}] [!] Image File Error {image_url}: {e}")
+            log_info(config, f"[{thread_name}] [!] Image File Error {image_url}: {e}")
         except Exception as e:
-            print(f"    [{thread_name}] [!] Unexpected Image Error {image_url}: {type(e).__name__} {e}")
+            log_info(config, f"[{thread_name}] [!] Unexpected Image Error {image_url}: {type(e).__name__} {e}")
 
         return None
     finally:
@@ -453,12 +530,12 @@ def worker_process_page(config: CrawlConfig, page_url: str, image_executor: conc
         page_q_size_str = str(len(config.pages_to_crawl_queue))
 
         if new_links_to_crawl:
-            print(f"[{thread_name}] Page: {page_url[:65]}... found {len(new_links_to_crawl)} new links. Page queue: {page_q_size_str}, Active images: {img_q_size_str}.")
+            log_verbose(config, f"[{thread_name}] Page: {page_url[:65]}... found {len(new_links_to_crawl)} new links. Page queue: {page_q_size_str}, Active images: {img_q_size_str}.")
         return new_links_to_crawl, None
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            print(f"[{thread_name}] [!] Skipping 404 Not Found for page: {page_url}")
+            log_verbose(config, f"[{thread_name}] [!] Skipping 404 Not Found for page: {page_url}")
         else:
             status_code_reason = f"{e.response.status_code} {e.response.reason}" if e.response is not None else "Unknown HTTP Error"
             continue_on_error(config, f"[{thread_name}] [!] HTTP Error {page_url}: {status_code_reason}")
@@ -467,13 +544,14 @@ def worker_process_page(config: CrawlConfig, page_url: str, image_executor: conc
         continue_on_error(config, f"[{thread_name}] [!] Request Error {page_url}: {e}")
         return None, page_url
     except Exception as e:
-        print(f"[{thread_name}] [!] Error processing {page_url}: {type(e).__name__} {e}")
+        log_info(config, f"[{thread_name}] [!] Error processing {page_url}: {type(e).__name__} {e}")
         return None, page_url
 
 # --- Main Crawler Logic ---
 def crawl_website(start_url, path_restriction_override, output_folder, image_url_include_filter=None,
                   image_url_exclude_filter=DEFAULT_EXCLUDE_FILTER, page_workers=DEFAULT_PAGE_WORKERS,
-                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False, max_image_size_mb=20.0):
+                  image_workers=DEFAULT_IMAGE_WORKERS, request_delay=DEFAULT_REQUEST_DELAY, resume=False,
+                  max_image_size_mb=20.0, verbose: bool = False):
 
     os.makedirs(output_folder, exist_ok=True)
 
@@ -484,8 +562,10 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
         image_url_exclude_filter=image_url_exclude_filter,
         request_delay=request_delay,
         max_image_size_mb=max_image_size_mb,
-        image_queue_semaphore=threading.Semaphore(image_workers * 20)
+        image_queue_semaphore=threading.Semaphore(image_workers * 20),
+        verbose=verbose
     )
+    config.logger = CrawlLogger(verbose)
 
     if resume:
         loaded_data = load_state(output_folder)
@@ -512,12 +592,14 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
             failed_images_list = loaded_data.get('failed_image_urls_to_retry', [])
             config.failed_image_urls_to_retry.extend(failed_images_list)
 
-            print(f"Resuming with {len(config.visited_urls_set)} visited URLs, {len(config.downloaded_image_urls_set)} downloaded images, and {len(config.pages_to_crawl_queue)} pages in the queue.")
+            log_info(config, f"Resuming with {len(config.visited_urls_set)} visited URLs, {len(config.downloaded_image_urls_set)} downloaded images, and {len(config.pages_to_crawl_queue)} pages in the queue.")
 
-    print(f"Starting crawl: {config.start_url}")
-    print(f"Output: {output_folder}, Page Workers: {page_workers}, Image Workers: {image_workers}, Delay: {request_delay}s")
-    if config.image_url_include_filter: print(f"Image URL include filter: '{config.image_url_include_filter}'")
-    if config.image_url_exclude_filter: print(f"Image URL exclude filter: '{config.image_url_exclude_filter}'")
+    log_info(config, f"Starting crawl: {config.start_url}")
+    log_info(config, f"Output: {output_folder}, Page Workers: {page_workers}, Image Workers: {image_workers}, Delay: {request_delay}s")
+    if config.image_url_include_filter:
+        log_info(config, f"Image URL include filter: '{config.image_url_include_filter}'")
+    if config.image_url_exclude_filter:
+        log_info(config, f"Image URL exclude filter: '{config.image_url_exclude_filter}'")
 
     parsed_start_url = urlparse(config.start_url)
     config.base_domain = parsed_start_url.netloc
@@ -531,7 +613,7 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
     if not path.endswith('/'):
         path += '/'
     config.base_path_restriction = urljoin(start_url, path)
-    print(f"Restricting crawl to paths starting with: {config.base_path_restriction}")
+    log_info(config, f"Restricting crawl to paths starting with: {config.base_path_restriction}")
 
     set_user_agent(config)
 
@@ -548,7 +630,7 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
             if start_url_normalized not in config.visited_urls_set:
                 config.visited_urls_set.add(start_url_normalized)
                 config.pages_to_crawl_queue.append(start_url_normalized)
-                print(f"Queued initial page: {start_url_normalized}")
+                log_info(config, f"Queued initial page: {start_url_normalized}")
 
     try:
         active_page_futures = set()
@@ -561,10 +643,10 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                 if start_url_normalized not in config.visited_urls_set:
                     config.visited_urls_set.add(start_url_normalized)
                     config.pages_to_crawl_queue.append(start_url_normalized)
-                    print(f"Queued initial page: {start_url_normalized}")
+                    log_info(config, f"Queued initial page: {start_url_normalized}")
 
         if resume and config.failed_image_urls_to_retry:
-            print(f"--- Re-queuing {len(config.failed_image_urls_to_retry)} failed images from previous session. ---")
+            log_info(config, f"--- Re-queuing {len(config.failed_image_urls_to_retry)} failed images from previous session. ---")
             with config.lock_failed_image_urls:
                 for img_url, src_url, alt in config.failed_image_urls_to_retry:
                     image_executor.submit(download_image_task, config, img_url, src_url, alt)
@@ -591,10 +673,17 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
                     if processed_pages_count % 10 == 0: # Log every 10 pages
                         img_q_size_str = str(image_executor._work_queue.qsize()) if image_executor and not image_executor._shutdown else 'N/A'
-                        print(f"Pages done: {processed_pages_count}, Active pages: {len(pending_page_futures)}, Visited: {len(config.visited_urls_set)}, Page Queue: {len(config.pages_to_crawl_queue)}, Images Queued: {img_q_size_str}, DL'd: {len(config.downloaded_image_urls_set)}")
+                        log_status(
+                            config,
+                            (
+                                f"Pages done: {processed_pages_count}, Active pages: {len(pending_page_futures)}, "
+                                f"Visited: {len(config.visited_urls_set)}, Page Queue: {len(config.pages_to_crawl_queue)}, "
+                                f"Images Queued: {img_q_size_str}, DL'd: {len(config.downloaded_image_urls_set)}"
+                            )
+                        )
 
                 except Exception as e:
-                    print(f"!!! Main loop: Page processing task failed: {e}")
+                    log_info(config, f"!!! Main loop: Page processing task failed: {e}")
 
             active_page_futures = pending_page_futures
 
@@ -606,7 +695,7 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
             # Check for pause/abort signals
             if config.pause_requested:
-                print("--- Pause requested. Waiting for active page workers to complete. ---")
+                log_info(config, "--- Pause requested. Waiting for active page workers to complete. ---")
                 # Wait for all current page futures to complete
                 for f in concurrent.futures.as_completed(active_page_futures):
                     _, failed_url = f.result()
@@ -624,7 +713,14 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                 config.long_request_delay = int(config.long_request_delay * 1.01)
                 config.max_fast_requests = max(1, int(config.max_fast_requests * 0.99))
                 config.max_requests = max(1, int(config.max_requests * 0.99))
-                print(f"--- Adjusted config: request_delay={config.request_delay:.2f}, min_request_delay={config.min_request_delay:.2f}, long_request_delay={config.long_request_delay}, max_fast_requests={config.max_fast_requests}, max_requests={config.max_requests} ---")
+                log_info(
+                    config,
+                    (
+                        f"--- Adjusted config: request_delay={config.request_delay:.2f}, "
+                        f"min_request_delay={config.min_request_delay:.2f}, long_request_delay={config.long_request_delay}, "
+                        f"max_fast_requests={config.max_fast_requests}, max_requests={config.max_requests} ---"
+                    )
+                )
 
                 while True: # Test-and-re-pause loop
                     # Clear session data
@@ -635,23 +731,29 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                     save_state(config)
 
                     if not failed_urls_to_retry:
-                        print("--- No failed URLs to test, resuming crawl. ---")
+                        log_info(config, "--- No failed URLs to test, resuming crawl. ---")
                         break
 
                     test_url = random.choice(list(failed_urls_to_retry))
 
                     random_global_delay = random.uniform(MIN_GLOBAL_DELAY, MAX_GLOBAL_DELAY)
-                    print(f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. Pausing for {random_global_delay:.2f} seconds. ---")
+                    log_info(
+                        config,
+                        (
+                            f"--- All page workers paused. {len(failed_urls_to_retry)} URLs failed and will be re-queued. "
+                            f"Pausing for {random_global_delay:.2f} seconds. ---"
+                        )
+                    )
                     time.sleep(random_global_delay)
 
-                    print(f"--- Paused. Testing connectivity with {test_url} before resuming. ---")
+                    log_info(config, f"--- Paused. Testing connectivity with {test_url} before resuming. ---")
                     try:
                         head_response = config.session.head(test_url, timeout=TIMEOUT_SECONDS)
                         head_response.raise_for_status()
-                        print(f"--- Connectivity test successful. Resuming crawl. ---")
+                        log_info(config, "--- Connectivity test successful. Resuming crawl. ---")
                         break  # Exit the pause loop
                     except requests.exceptions.RequestException as e:
-                        print(f"--- Connectivity test failed: {e}. Re-pausing. ---")
+                        log_info(config, f"--- Connectivity test failed: {e}. Re-pausing. ---")
 
                 failed_urls_to_retry.clear()
 
@@ -662,7 +764,7 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
 
                 with config.condition:
                     config.pause_requested = False
-                print("--- Resuming crawl. ---")
+                log_info(config, "--- Resuming crawl. ---")
 
                 # Repopulate active futures to continue the main loop
                 while config.pages_to_crawl_queue and len(active_page_futures) < page_workers:
@@ -670,21 +772,21 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                     future = page_executor.submit(worker_process_page, config, page_url, image_executor, image_workers)
                     active_page_futures.add(future)
 
-        print("All page processing tasks have completed.")
+        log_info(config, "All page processing tasks have completed.")
 
         page_executor.shutdown(wait=True)
         if image_executor:
-            print("\nWaiting for all pending image downloads to complete...")
+            log_info(config, "\nWaiting for all pending image downloads to complete...")
             image_executor.shutdown(wait=True)
-            print("All image downloads completed.")
+            log_info(config, "All image downloads completed.")
 
     except BaseException as e:
         interrupted = True
         with config.condition:
             config.abort_all = True
 
-        print(f"\n--- Crawl Interrupted by {type(e).__name__} ---\n{e}")
-        print("Attempting to cancel pending tasks and shut down executors...")
+        log_info(config, f"\n--- Crawl Interrupted by {type(e).__name__} ---\n{e}")
+        log_info(config, "Attempting to cancel pending tasks and shut down executors...")
 
     finally:
         # Final state save
@@ -698,10 +800,11 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
         if config.session:
             config.session.close()
 
-        print(f"\n--- Crawl {'Interrupted' if interrupted else 'Finished'} ---")
-        print(f"Total pages visited (approx): {len(config.visited_urls_set)}")
-        print(f"Total unique images processed/downloaded (approx): {len(config.downloaded_image_urls_set)}")
-        print(f"Images saved to: {os.path.abspath(config.output_folder)}")
+        flush_status(config)
+        log_info(config, f"\n--- Crawl {'Interrupted' if interrupted else 'Finished'} ---")
+        log_info(config, f"Total pages visited (approx): {len(config.visited_urls_set)}")
+        log_info(config, f"Total unique images processed/downloaded (approx): {len(config.downloaded_image_urls_set)}")
+        log_info(config, f"Images saved to: {os.path.abspath(config.output_folder)}")
 
     if interrupted:
         return False
@@ -759,6 +862,7 @@ if __name__ == "__main__":
                         help=f"Base delay between requests in seconds (actual delay includes jitter, default: {DEFAULT_REQUEST_DELAY}).")
     parser.add_argument("--resume", action="store_true", help="Resume a previous crawl from the state file in the output directory.")
     parser.add_argument("--max-image-size", type=float, default=20.0, help="Maximum image size in MB to download (default: 20.0).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging (per-page and per-image details).")
 
     args = parser.parse_args()
 
@@ -771,7 +875,7 @@ if __name__ == "__main__":
 
         start_time = time.time()
         crawl_website(args.start_url, args.path_restriction_override, abs_output_folder, args.include_filter, args.exclude_filter,
-                      args.page_workers, args.image_workers, args.request_delay, args.resume, args.max_image_size)
+                      args.page_workers, args.image_workers, args.request_delay, args.resume, args.max_image_size, args.verbose)
         end_time = time.time()
         print(f"Total execution time: {end_time - start_time:.2f} seconds.")
         print("Exiting.")
