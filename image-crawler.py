@@ -710,9 +710,9 @@ def crawl_website(start_url, path_restriction_override, output_folder, image_url
                 # Adjust delay and request limits
                 config.request_delay *= 1.01
                 config.min_request_delay *= 1.01
-                config.long_request_delay = int(config.long_request_delay * 1.01)
-                config.max_fast_requests = max(1, int(config.max_fast_requests * 0.99))
-                config.max_requests = max(1, int(config.max_requests * 0.99))
+                config.long_request_delay = int(config.long_request_delay * 1.001)
+                config.max_fast_requests = max(1, int(config.max_fast_requests * 0.999))
+                config.max_requests = max(1, int(config.max_requests * 0.999))
                 log_info(
                     config,
                     (
