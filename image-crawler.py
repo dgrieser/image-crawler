@@ -184,7 +184,7 @@ class AdaptiveLimiter:
 
     def reward(self):
         self._consecutive_ok += 1
-        if self._consecutive_ok >= 40 and self.min_interval > self.base:
+        if self._consecutive_ok >= 10 and self.min_interval > self.base:
             self.min_interval = max(self.base, self.min_interval * 0.9)
             self._consecutive_ok = 0
 
@@ -751,7 +751,10 @@ class Crawler:
         self.image_seen = {row[0]: (row[1], row[2]) for row in state.get("image_seen", []) if row}
         self.image_done = set(state.get("image_done", []))
         self.requests = state.get("requests", 0)
-        self.limiter.min_interval = max(self.limiter.base, state.get("min_interval", self.limiter.base))
+        # Intentionally do NOT restore min_interval: the adaptive penalty ratchets
+        # up fast (x1.5/hit) and decays slowly, so a throttled prior run leaves a
+        # large interval that would otherwise persist across every resume. Start
+        # fresh at base and let the limiter re-learn the server's tolerance.
         self.log.info(
             f"--- Resumed: {len(self.processed_pages)} pages done, "
             f"{len(self.seen_pages) - len(self.processed_pages)} pending, "
