@@ -31,6 +31,7 @@ import random
 import re
 import signal
 import sys
+import tempfile
 import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -74,6 +75,7 @@ MAX_INTERVAL = 60.0          # ceiling for the adaptive interval
 CHROME_VERSION = "141.0.0.0"
 
 STATE_FILE = "crawl_state.json"
+LOCK_FILE = "crawl.lock"     # single-instance guard inside the output dir
 STATE_VERSION = 2
 CHECKPOINT_INTERVAL = 15.0   # seconds between background state saves
 
@@ -387,6 +389,7 @@ class Crawler:
         self.requests = 0
         self.images_saved = 0
         self._signals_installed: list[int] = []
+        self._lock_path: Optional[Path] = None
 
     # -- HTTP ------------------------------------------------------------- #
     def _headers(self) -> dict:
@@ -719,10 +722,23 @@ class Crawler:
         }
         try:
             self.output.mkdir(parents=True, exist_ok=True)
-            tmp = self.output / (STATE_FILE + ".tmp")
-            with open(tmp, "w") as fh:
-                json.dump(state, fh, indent=2)
-            os.replace(tmp, self.output / STATE_FILE)
+            # Unique temp name per write: a fixed "<state>.tmp" is racy when two
+            # writers (e.g. an accidental second instance) share the dir - both
+            # rename the same path and the loser hits ENOENT. mkstemp gives each
+            # write its own file; the final os.replace is still atomic.
+            fd, tmp_name = tempfile.mkstemp(
+                dir=self.output, prefix=STATE_FILE + ".", suffix=".tmp")
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(state, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, self.output / STATE_FILE)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                raise
             if not quiet:
                 self.log.info(f"--- State saved to {self.output / STATE_FILE} ---")
         except Exception as exc:
@@ -812,6 +828,70 @@ class Crawler:
             with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
                 loop.remove_signal_handler(sig)
 
+    # -- Single-instance lock --------------------------------------------- #
+    @staticmethod
+    def _read_lock_pid(path: Path) -> Optional[int]:
+        try:
+            text = path.read_text().strip()
+            return int(text) if text else None
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _pid_alive(pid: Optional[int]) -> bool:
+        if not pid or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, just owned by another user
+        return True
+
+    def _acquire_lock(self) -> bool:
+        """Refuse to run if another live instance owns this output dir.
+
+        Two crawlers sharing one -o dir clobber each other's state file and
+        double the request rate (server throttling). The lock holds our PID;
+        a lock left by a dead process is treated as stale and reclaimed.
+        """
+        self.output.mkdir(parents=True, exist_ok=True)
+        path = self.output / LOCK_FILE
+        for _ in range(2):  # at most one stale-lock reclaim, then give up
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                other = self._read_lock_pid(path)
+                if self._pid_alive(other):
+                    self.log.info(
+                        f"!!! Another crawler (pid {other}) is using "
+                        f"{self.output}; refusing to start a second instance. "
+                        f"Stop it first, or use a different -o output dir.")
+                    return False
+                self.log.info(
+                    f"--- Reclaiming stale lock {path} (pid {other} not "
+                    f"running). ---")
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            with os.fdopen(fd, "w") as fh:
+                fh.write(str(os.getpid()))
+            self._lock_path = path
+            return True
+        self.log.info(f"!!! Could not acquire lock {path}.")
+        return False
+
+    def _release_lock(self):
+        if self._lock_path is None:
+            return
+        # Only remove the lock if it is still ours (don't delete a lock a
+        # reclaiming instance may have rewritten).
+        if self._read_lock_pid(self._lock_path) == os.getpid():
+            with contextlib.suppress(OSError):
+                self._lock_path.unlink()
+        self._lock_path = None
+
     async def _seed(self):
         if self.resume:
             self.load_state()
@@ -858,6 +938,8 @@ class Crawler:
 
     async def run(self) -> bool:
         self.output.mkdir(parents=True, exist_ok=True)
+        if not self._acquire_lock():
+            return False
         self._install_signals()
         limits = httpx.Limits(
             max_connections=self.page_conc + self.image_conc + 10,
@@ -900,6 +982,7 @@ class Crawler:
             self._remove_signals()
             self.log.flush()
             self.save_state(quiet=False)
+            self._release_lock()
             self.log.info(f"\n--- Crawl {'interrupted' if interrupted else 'finished'} ---")
             self.log.info(f"Pages processed: {len(self.processed_pages)} "
                           f"(discovered {len(self.seen_pages)})")
