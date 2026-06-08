@@ -71,7 +71,17 @@ DEFAULT_JITTER = 0.3         # +/- fraction applied to the interval
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_IMAGE_MB = 20.0
+DEFAULT_DOMAIN_STORE = str(Path.home() / ".image-crawler" / "domains.json")
 MAX_INTERVAL = 60.0          # ceiling for the adaptive interval
+INTERVAL_FLOOR = 0.5         # min interval a penalty assumes (bites at --delay 0)
+BACKOFF_FACTOR = 1.5         # interval growth per *distinct* throttle burst
+RECOVER_AFTER = 8            # consecutive successes before one AIMD relax step
+RECOVER_FRACTION = 0.1       # relax step = max(RECOVER_MIN, fraction * interval)
+RECOVER_MIN = 0.5            # smallest relax step, seconds
+SAFE_MARGIN = 1.15           # operate this far above the worst throttling interval
+LONG_WAIT_AFTER = 3          # consecutive throttle bursts -> one long cooldown
+LONG_COOLDOWN = 90.0         # one-shot pause to reset a server's rate-limit window
+MAX_RETRY_AFTER = 300.0      # honour a server Retry-After up to this many seconds
 CHROME_VERSION = "141.0.0.0"
 
 STATE_FILE = "crawl_state.json"
@@ -137,10 +147,22 @@ class AdaptiveLimiter:
     """
     Paces the *start* of every request to roughly one per ``min_interval``
     seconds (with jitter), regardless of how many coroutines are in flight, so
-    the effective request rate is bounded. On a throttling signal it:
-      * extends a global pause that every worker waits on, and
-      * multiplicatively widens ``min_interval`` (up to ``MAX_INTERVAL``).
-    Sustained success slowly relaxes the interval back toward ``base``.
+    the effective request rate is bounded.
+
+    The interval follows AIMD (the TCP-congestion-control rule), which probes
+    for and converges on the server's actual tolerance:
+
+      * **Multiplicative increase** on throttling - ``min_interval`` widens by
+        ``BACKOFF_FACTOR`` *once per distinct burst*. Concurrent failures from
+        the same overload event are coalesced (they only extend the shared
+        pause), so N in-flight 429s can't blow the interval up N times.
+      * **Additive decrease** on sustained success - the interval relaxes one
+        small step at a time, but never below ``SAFE_MARGIN`` above the widest
+        interval the server *still* throttled. That floor is the limiter's
+        reverse-engineered estimate of the domain's rate limit; it is persisted
+        so a resume starts at the learned delay instead of re-probing from base.
+      * Repeated bursts (>= ``LONG_WAIT_AFTER``) trigger one ``LONG_COOLDOWN``
+        pause to ride out a fixed/sliding rate-limit window before resuming.
     """
 
     def __init__(self, base_delay: float, jitter: float):
@@ -151,6 +173,11 @@ class AdaptiveLimiter:
         self._pause_until = 0.0   # monotonic time the global pause ends
         self._lock = asyncio.Lock()
         self._consecutive_ok = 0
+        self._penalty_streak = 0  # consecutive throttle *bursts* (reset on success)
+        # The widest request interval that STILL drew a throttle: the learned
+        # rate-limit estimate. Safe operation sits SAFE_MARGIN above it. 0 = the
+        # domain has never throttled us, so run at base (full speed).
+        self.throttle_interval = 0.0
 
     async def acquire(self):
         # Reserve a paced slot, then sleep to it. If a penalty extends the global
@@ -175,20 +202,55 @@ class AdaptiveLimiter:
 
     def penalize(self, retry_after: Optional[float] = None):
         now = time.monotonic()
-        backoff = retry_after if retry_after is not None else max(self.min_interval * 2.0, 5.0)
-        backoff = min(backoff, MAX_INTERVAL)
-        self._pause_until = max(self._pause_until, now + backoff)
-        # Widen the global interval; floor at 0.5s so a penalty bites even when
-        # the user configured --delay 0.
-        widened = max(self.min_interval, self.base, 0.5) * 1.5
-        self.min_interval = min(MAX_INTERVAL, widened)
-        self._consecutive_ok = 0
+        # A "burst" is the first failure of a fresh throttle event: we are not
+        # already inside a pause one of its siblings opened. Only the burst leader
+        # widens the interval and counts toward the streak; the rest just pile
+        # onto the shared pause. This is what stops a fan-out of concurrent 429s
+        # from multiplying the interval up to the ceiling in one shot.
+        burst = now >= self._pause_until
+        if burst:
+            # Record the interval that drew this throttle (widest seen) BEFORE
+            # widening - that is the learned limit we must stay above.
+            self.throttle_interval = max(self.throttle_interval, self.min_interval, INTERVAL_FLOOR)
+            self._penalty_streak += 1
+            self._consecutive_ok = 0
+            widened = max(self.min_interval, self.base, INTERVAL_FLOOR) * BACKOFF_FACTOR
+            self.min_interval = min(MAX_INTERVAL, widened)
+        # Choose the pause. A server's Retry-After always wins (and still extends
+        # the shared pause even for coalesced failures). After repeated bursts,
+        # take one long cooldown to let a windowed limiter reset.
+        if retry_after is not None:
+            pause = min(retry_after, MAX_RETRY_AFTER)
+        elif self._penalty_streak >= LONG_WAIT_AFTER:
+            pause = LONG_COOLDOWN
+        else:
+            pause = max(self.min_interval * 2.0, 5.0)
+        self._pause_until = max(self._pause_until, now + pause)
 
     def reward(self):
         self._consecutive_ok += 1
-        if self._consecutive_ok >= 10 and self.min_interval > self.base:
-            self.min_interval = max(self.base, self.min_interval * 0.9)
-            self._consecutive_ok = 0
+        self._penalty_streak = 0
+        # Never relax below a margin above the worst interval the server threw a
+        # throttle at; that floor is the learned rate limit.
+        floor = self.base
+        if self.throttle_interval:
+            floor = max(self.base, self.throttle_interval * SAFE_MARGIN)
+        if self._consecutive_ok < RECOVER_AFTER or self.min_interval <= floor:
+            return
+        self._consecutive_ok = 0
+        # AIMD additive decrease: a proportional step (faster relaxation when far
+        # out, RECOVER_MIN floor when near base) toward the learned safe point.
+        step = max(RECOVER_MIN, self.min_interval * RECOVER_FRACTION)
+        self.min_interval = max(floor, self.min_interval - step)
+
+    def restore(self, throttle_interval: Optional[float]):
+        """Resume at a domain's previously discovered safe delay. Given the
+        widest interval that was throttled last run, start SAFE_MARGIN above it
+        rather than re-probing the limit from ``base`` (and re-eating the bans)."""
+        self.throttle_interval = max(0.0, throttle_interval or 0.0)
+        if self.throttle_interval:
+            self.min_interval = min(
+                MAX_INTERVAL, max(self.base, self.throttle_interval * SAFE_MARGIN))
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +424,8 @@ class Crawler:
         self.user_agent = args.user_agent
         self.resume = args.resume
         self.path_override = args.path_restriction
+        # Shared cross-run delay cache (keyed by domain), independent of -o dir.
+        self.domain_store = None if args.no_domain_store else args.domain_store
 
         self.limiter = AdaptiveLimiter(args.delay, args.jitter)
 
@@ -685,12 +749,15 @@ class Crawler:
         try:
             while not self.stop_event.is_set():
                 await asyncio.sleep(1.0)
+                interval = f"interval {self.limiter.min_interval:.2f}s"
+                if self.limiter.throttle_interval:
+                    interval += f" (limit~{self.limiter.throttle_interval:.2f}s)"
                 self.log.status(
                     f"pages {len(self.processed_pages)}/{len(self.seen_pages)} "
                     f"(q{self.page_queue.qsize()}) | "
                     f"images {self.images_saved}/{len(self.image_seen)} "
                     f"(q{self.image_queue.qsize()}) | "
-                    f"reqs {self.requests} | interval {self.limiter.min_interval:.2f}s"
+                    f"reqs {self.requests} | {interval}"
                 )
         except asyncio.CancelledError:
             pass
@@ -718,6 +785,7 @@ class Crawler:
             "image_done": sorted(self.image_done),
             "requests": self.requests,
             "min_interval": self.limiter.min_interval,
+            "throttle_interval": self.limiter.throttle_interval,
             "saved_at": time.time(),
         }
         try:
@@ -743,6 +811,8 @@ class Crawler:
                 self.log.info(f"--- State saved to {self.output / STATE_FILE} ---")
         except Exception as exc:
             self.log.info(f"!!! Error saving state: {exc}")
+        # Independent of local-state success: keep the shared per-domain cache warm.
+        self._save_domain_store()
 
     def load_state(self) -> bool:
         path = self.output / STATE_FILE
@@ -767,17 +837,100 @@ class Crawler:
         self.image_seen = {row[0]: (row[1], row[2]) for row in state.get("image_seen", []) if row}
         self.image_done = set(state.get("image_done", []))
         self.requests = state.get("requests", 0)
-        # Intentionally do NOT restore min_interval: the adaptive penalty ratchets
-        # up fast (x1.5/hit) and decays slowly, so a throttled prior run leaves a
-        # large interval that would otherwise persist across every resume. Start
-        # fresh at base and let the limiter re-learn the server's tolerance.
+        # Restore the *learned limit* (not the raw min_interval, which may be a
+        # transient penalty spike): resume SAFE_MARGIN above the widest interval
+        # the server throttled last run, so we keep the discovered delay instead
+        # of re-probing - and re-eating the bans - from base every resume.
+        self.limiter.restore(state.get("throttle_interval", 0.0))
         self.log.info(
             f"--- Resumed: {len(self.processed_pages)} pages done, "
             f"{len(self.seen_pages) - len(self.processed_pages)} pending, "
             f"{len(self.image_done)} images done, "
             f"{len(self.image_seen) - len(self.image_done)} images pending. ---"
         )
+        if self.limiter.throttle_interval:
+            self.log.info(
+                f"--- Learned delay for {self.base_domain or 'domain'}: "
+                f"~{self.limiter.throttle_interval:.2f}s throttle limit -> "
+                f"starting at {self.limiter.min_interval:.2f}s interval. ---")
         return True
+
+    # -- Shared per-domain delay cache ------------------------------------ #
+    @staticmethod
+    def _store_limit(entry) -> float:
+        """Read a domain's learned throttle interval from a store entry, tolerating
+        both the dict form and a bare number (older/hand-edited files)."""
+        if isinstance(entry, dict):
+            try:
+                return float(entry.get("throttle_interval", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        try:
+            return float(entry or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _load_domain_store(self):
+        """Seed the limiter from a delay learned for this domain on a *previous*
+        run - even one that used a different -o dir. Merges (max) with whatever
+        the local resume state already restored, so the most cautious value wins."""
+        if not self.domain_store or not self.base_domain:
+            return
+        try:
+            with open(self.domain_store) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        learned = self._store_limit(data.get(self.base_domain))
+        if learned > self.limiter.throttle_interval:
+            self.limiter.restore(learned)
+            self.log.info(
+                f"--- Shared delay memory: {self.base_domain} limit "
+                f"~{self.limiter.throttle_interval:.2f}s -> starting at "
+                f"{self.limiter.min_interval:.2f}s interval. ---")
+
+    def _save_domain_store(self):
+        """Persist this domain's learned limit back to the shared cache. Reads,
+        merges, and atomically rewrites so a concurrent crawler on *another*
+        domain isn't clobbered, and the stored limit only ratchets up (cautious)."""
+        if not self.domain_store or not self.base_domain:
+            return
+        if self.limiter.throttle_interval <= 0:
+            return  # nothing learned this run; don't write a meaningless 0
+        store_path = Path(self.domain_store)
+        try:
+            store_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            try:
+                with open(store_path) as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+            merged = max(self._store_limit(data.get(self.base_domain)),
+                         self.limiter.throttle_interval)
+            data[self.base_domain] = {
+                "throttle_interval": round(merged, 3),
+                "updated_at": time.time(),
+            }
+            fd, tmp_name = tempfile.mkstemp(
+                dir=store_path.parent, prefix=store_path.name + ".", suffix=".tmp")
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(data, fh, indent=2, sort_keys=True)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, store_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                raise
+        except Exception as exc:
+            self.log.verbose(f"[!] could not update domain store {store_path}: {exc}")
 
     # -- Setup / run ------------------------------------------------------ #
     def setup_bounds(self):
@@ -896,6 +1049,7 @@ class Crawler:
         if self.resume:
             self.load_state()
         self.setup_bounds()
+        self._load_domain_store()
         self.log.info(f"Crawl: {self.start_url}")
         self.log.info(f"Output: {self.output}  |  pages x{self.page_conc}  images x{self.image_conc}  "
                       f"delay {self.limiter.base}s (+/-{int(self.limiter.jitter*100)}%)")
@@ -1034,6 +1188,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-agent", default=None, help="Override the User-Agent header.")
     p.add_argument("--resume", action="store_true",
                    help="Resume from crawl_state.json in the output folder.")
+    p.add_argument("--domain-store", default=DEFAULT_DOMAIN_STORE,
+                   help="JSON file caching the learned per-domain delay across runs "
+                        f"and output dirs (default: {DEFAULT_DOMAIN_STORE}).")
+    p.add_argument("--no-domain-store", action="store_true",
+                   help="Don't read or write the shared per-domain delay cache.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Per-page / per-image logging.")
     return p
