@@ -79,6 +79,10 @@ RECOVER_AFTER = 8            # consecutive successes before one AIMD relax step
 RECOVER_FRACTION = 0.1       # relax step = max(RECOVER_MIN, fraction * interval)
 RECOVER_MIN = 0.5            # smallest relax step, seconds
 SAFE_MARGIN = 1.15           # operate this far above the worst throttling interval
+RESUME_PROBE_FRACTION = 0.5  # on resume, re-probe down to this fraction of the
+                             # learned limit (the server's rate window may have
+                             # reset since) instead of pinning SAFE_MARGIN above
+                             # it; the first fresh throttle relocks the cautious floor
 LONG_WAIT_AFTER = 3          # consecutive throttle bursts -> one long cooldown
 LONG_COOLDOWN = 90.0         # one-shot pause to reset a server's rate-limit window
 MAX_RETRY_AFTER = 300.0      # honour a server Retry-After up to this many seconds
@@ -161,6 +165,9 @@ class AdaptiveLimiter:
         interval the server *still* throttled. That floor is the limiter's
         reverse-engineered estimate of the domain's rate limit; it is persisted
         so a resume starts at the learned delay instead of re-probing from base.
+        On *resume* that floor is loosened to ``RESUME_PROBE_FRACTION`` of the
+        learned limit, so a resumed run starts cautious but speeds back up if the
+        server now tolerates it; the first fresh throttle relocks the full floor.
       * Repeated bursts (>= ``LONG_WAIT_AFTER``) trigger one ``LONG_COOLDOWN``
         pause to ride out a fixed/sliding rate-limit window before resuming.
     """
@@ -174,6 +181,9 @@ class AdaptiveLimiter:
         self._lock = asyncio.Lock()
         self._consecutive_ok = 0
         self._penalty_streak = 0  # consecutive throttle *bursts* (reset on success)
+        # Set on resume: loosen the recovery floor so this run can probe back
+        # below the learned limit. Cleared by the first fresh throttle (relock).
+        self._probe_floor = False
         # The widest request interval that STILL drew a throttle: the learned
         # rate-limit estimate. Safe operation sits SAFE_MARGIN above it. 0 = the
         # domain has never throttled us, so run at base (full speed).
@@ -212,6 +222,12 @@ class AdaptiveLimiter:
             # Record the interval that drew this throttle (widest seen) BEFORE
             # widening - that is the learned limit we must stay above.
             self.throttle_interval = max(self.throttle_interval, self.min_interval, INTERVAL_FLOOR)
+            if self._probe_floor:
+                # Probing below the learned limit drew a throttle: snap back up to
+                # the cautious floor (we may be below it), stop re-probing, and
+                # respect the full floor for the rest of this run.
+                self.min_interval = max(self.min_interval, self.throttle_interval * SAFE_MARGIN)
+                self._probe_floor = False
             self._penalty_streak += 1
             self._consecutive_ok = 0
             widened = max(self.min_interval, self.base, INTERVAL_FLOOR) * BACKOFF_FACTOR
@@ -234,7 +250,10 @@ class AdaptiveLimiter:
         # throttle at; that floor is the learned rate limit.
         floor = self.base
         if self.throttle_interval:
-            floor = max(self.base, self.throttle_interval * SAFE_MARGIN)
+            # On resume probe down toward RESUME_PROBE_FRACTION of the learned
+            # limit; otherwise hold the cautious SAFE_MARGIN floor.
+            margin = RESUME_PROBE_FRACTION if self._probe_floor else SAFE_MARGIN
+            floor = max(self.base, self.throttle_interval * margin)
         if self._consecutive_ok < RECOVER_AFTER or self.min_interval <= floor:
             return
         self._consecutive_ok = 0
@@ -246,11 +265,17 @@ class AdaptiveLimiter:
     def restore(self, throttle_interval: Optional[float]):
         """Resume at a domain's previously discovered safe delay. Given the
         widest interval that was throttled last run, start SAFE_MARGIN above it
-        rather than re-probing the limit from ``base`` (and re-eating the bans)."""
+        rather than re-probing the limit from ``base`` (and re-eating the bans).
+
+        The start stays cautious, but the recovery floor is loosened to
+        ``RESUME_PROBE_FRACTION`` of the learned limit so a resumed run speeds
+        back up if the server's rate window has reset; a fresh throttle relocks
+        the full floor (see ``penalize``)."""
         self.throttle_interval = max(0.0, throttle_interval or 0.0)
         if self.throttle_interval:
             self.min_interval = min(
                 MAX_INTERVAL, max(self.base, self.throttle_interval * SAFE_MARGIN))
+            self._probe_floor = True
 
 
 # --------------------------------------------------------------------------- #
@@ -852,7 +877,8 @@ class Crawler:
             self.log.info(
                 f"--- Learned delay for {self.base_domain or 'domain'}: "
                 f"~{self.limiter.throttle_interval:.2f}s throttle limit -> "
-                f"starting at {self.limiter.min_interval:.2f}s interval. ---")
+                f"starting at {self.limiter.min_interval:.2f}s interval, "
+                f"probing down to ~{max(self.limiter.base, self.limiter.throttle_interval * RESUME_PROBE_FRACTION):.2f}s. ---")
         return True
 
     # -- Shared per-domain delay cache ------------------------------------ #
